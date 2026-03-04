@@ -6,7 +6,7 @@ Acode相关项目的全部引用和共享工具
 | 目录 | 仓库 | 说明 |
 |------|------|------|
 | [Acode](Acode/) | [Ebola-Chan-bot/Acode](https://github.com/Ebola-Chan-bot/Acode) | Acode 代码编辑器主体 |
-| [acodex-server](acodex-server/) | [bajrangCoder/acodex-server](https://github.com/bajrangCoder/acodex-server) | AcodeX 终端插件服务端 |
+| [acodex-server](acodex-server/) | [Ebola-Chan-bot/acodex_server](https://github.com/Ebola-Chan-bot/acodex_server) | AcodeX 终端插件服务端 |
 | [acode-plugin-github](acode-plugin-github/) | [Ebola-Chan-bot/acode-plugin-github](https://github.com/Ebola-Chan-bot/acode-plugin-github) | Acode GitHub 插件 |
 
 ## 克隆 / Clone
