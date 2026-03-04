@@ -1,0 +1,9 @@
+[submodule "Acode"]
+	path = Acode
+	url = https://github.com/Ebola-Chan-bot/Acode.git
+[submodule "acodex-server"]
+	path = acodex-server
+	url = https://github.com/bajrangCoder/acodex-server.git
+[submodule "acode-plugin-github"]
+	path = acode-plugin-github
+	url = https://github.com/Ebola-Chan-bot/acode-plugin-github.git
