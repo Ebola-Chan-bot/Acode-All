@@ -895,6 +895,49 @@ function 同步插件资产 {
     }
 }
 
+# ─── 注入调试客户端 ───────────────────────────────────────────────────
+function 注入调试客户端 {
+    if ($构建模式 -eq "release") { return }
+
+    $平台IndexHtml = Join-Path $平台AssetsWww "index.html"
+    if (-not (Test-Path $平台IndexHtml)) {
+        输出警告 "平台 index.html 不存在，跳过调试客户端注入"
+        return
+    }
+
+    # 检测局域网IP
+    $候选 = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
+        $_.PrefixOrigin -ne "WellKnown" -and
+        $_.IPAddress -notmatch '^169\.254\.' -and
+        $_.InterfaceAlias -notmatch 'Loopback|vEthernet|Hyper-V|WSL|VirtualBox|VMware|isatap|Teredo|Bluetooth'
+    }
+    $内网IP = ($候选 | Where-Object {
+        $_.IPAddress -match '^192\.168\.' -or $_.IPAddress -match '^10\.' -or
+        $_.IPAddress -match '^172\.(1[6-9]|2[0-9]|3[0-1])\.'
+    } | Select-Object -First 1).IPAddress
+    if (-not $内网IP) { $内网IP = ($候选 | Select-Object -First 1).IPAddress }
+    if (-not $内网IP) { $内网IP = "127.0.0.1" }
+
+    $调试端口 = 8092
+    $调试脚本标签 = "    <!-- HDC_DEBUG --><script src=`"http://${内网IP}:${调试端口}/__debug_client.js`"></script>"
+
+    $内容 = Get-Content $平台IndexHtml -Raw -Encoding UTF8
+
+    # 清除旧版调试注入（可能是内联脚本块）
+    if ($内容 -match "HDC_DEBUG") {
+        $内容 = $内容 -replace '(?s)\s*<!-- HDC_DEBUG -->.*?</script>\s*', "`n"
+        输出警告 "已清除旧版调试注入"
+    }
+
+    # 在 cordova.js 之前插入
+    $内容 = $内容 -replace '(\s*<script src="cordova\.js"></script>)', "`n$调试脚本标签`n`$1"
+    [System.IO.File]::WriteAllText($平台IndexHtml, $内容, [System.Text.UTF8Encoding]::new($false))
+
+    输出步骤 "注入调试客户端"
+    输出成功 "调试服务器地址: http://${内网IP}:${调试端口}"
+    输出成功 "已注入到平台 index.html（仅影响构建产物，不修改源文件）"
+}
+
 # ─── 构建前端资源 ─────────────────────────────────────────────────────
 function 构建前端 {
     输出步骤 "构建前端资源"
@@ -1136,6 +1179,7 @@ switch ($动作) {
         初始化构建环境
         构建前端
         同步资产
+        注入调试客户端
         构建APK
     }
 
@@ -1155,6 +1199,7 @@ switch ($动作) {
         编译AcodexServer
         构建前端
         同步资产
+        注入调试客户端
         $APK文件 = 构建APK
         部署APK -APK路径 $APK文件
 
