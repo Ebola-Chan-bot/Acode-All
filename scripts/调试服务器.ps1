@@ -25,18 +25,34 @@ $ErrorActionPreference = "Stop"
 $日志目录 = Join-Path $PSScriptRoot "logs"
 if (-not (Test-Path $日志目录)) { New-Item -ItemType Directory -Path $日志目录 -Force | Out-Null }
 $日志文件 = Join-Path $日志目录 "调试服务器.log"
-Start-Transcript -Path $日志文件 -Force | Out-Null
+# 停止已有 Transcript（忽略无活跃 transcript 的错误）
+$旧ErrorPref = $ErrorActionPreference; $ErrorActionPreference = "SilentlyContinue"
+Stop-Transcript 2>$null
+$ErrorActionPreference = $旧ErrorPref
+if (Test-Path $日志文件) { Remove-Item $日志文件 -Force -ErrorAction SilentlyContinue }
+try { Start-Transcript -Path $日志文件 -Force | Out-Null } catch {
+    Write-Warning "Transcript 无法开启: $_  （日志将仅输出到控制台）"
+}
 
 # ─── 局域网 IP ───────────────────────────────────────────────────────
 function 获取局域网IP {
     $候选 = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
         $_.PrefixOrigin -ne "WellKnown" -and
         $_.IPAddress -notmatch '^169\.254\.' -and
-        $_.InterfaceAlias -notmatch 'Loopback|vEthernet|Hyper-V|WSL|VirtualBox|VMware|isatap|Teredo|Bluetooth'
+        $_.IPAddress -ne '127.0.0.1' -and
+        $_.InterfaceAlias -notmatch 'Loopback|vEthernet|Hyper-V|WSL|VirtualBox|VMware|isatap|Teredo|Bluetooth|本地连接\*'
     }
+    # 优先 WLAN/Wi-Fi/以太网等实际物理网卡（DHCP 分配的地址）
     $内网 = $候选 | Where-Object {
-        $_.IPAddress -match '^192\.168\.' -or $_.IPAddress -match '^10\.' -or
-        $_.IPAddress -match '^172\.(1[6-9]|2[0-9]|3[0-1])\.'
+        $_.InterfaceAlias -match 'WLAN|Wi-Fi|以太网|Ethernet' -and $_.PrefixOrigin -eq 'Dhcp'
+    } | Select-Object -First 1
+    if ($内网) { return $内网.IPAddress }
+    # fallback：任意 DHCP 私有 IP
+    $内网 = $候选 | Where-Object {
+        $_.PrefixOrigin -eq 'Dhcp' -and (
+            $_.IPAddress -match '^192\.168\.' -or $_.IPAddress -match '^10\.' -or
+            $_.IPAddress -match '^172\.(1[6-9]|2[0-9]|3[0-1])\.'
+        )
     } | Select-Object -First 1
     if ($内网) { return $内网.IPAddress }
     $任意 = $候选 | Select-Object -First 1

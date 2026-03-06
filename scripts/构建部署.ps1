@@ -223,6 +223,87 @@ function 初始化构建环境 {
     }
     检查命令 "cargo" "请安装 Rust: https://rustup.rs/"
     输出成功 "Rust: $(rustc --version)"
+
+    # zig 工具链（musl 交叉编译所需，axs 运行在 proot Alpine 中需要 musl 链接）
+    $script:Zig路径 = $null
+    $Zig命令 = Get-Command zig -ErrorAction SilentlyContinue
+    if ($Zig命令) {
+        $script:Zig路径 = $Zig命令.Source
+    } else {
+        # 在 winget 常见安装位置搜索
+        $WingetPkg目录 = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages"
+        if (Test-Path $WingetPkg目录) {
+            $Zig文件 = Get-ChildItem $WingetPkg目录 -Directory -Filter "zig.zig_*" -ErrorAction SilentlyContinue |
+                ForEach-Object { Get-ChildItem $_.FullName -Recurse -Filter "zig.exe" -ErrorAction SilentlyContinue } |
+                Select-Object -First 1
+            if ($Zig文件) { $script:Zig路径 = $Zig文件.FullName }
+        }
+        # 也检查 winget links 目录
+        if (-not $script:Zig路径) {
+            $链接路径 = "$env:LOCALAPPDATA\Microsoft\WinGet\Links\zig.exe"
+            if (Test-Path $链接路径) { $script:Zig路径 = $链接路径 }
+        }
+    }
+    if (-not $script:Zig路径) {
+        输出步骤 "安装 zig（musl 交叉编译所需）"
+        if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+            输出错误 "找不到 zig 且 winget 不可用，请手动安装 zig: https://ziglang.org/download/"
+            exit 1
+        }
+        winget install zig.zig --accept-source-agreements --accept-package-agreements --silent 2>&1 | ForEach-Object { Write-Host "  $_" }
+        # 安装后搜索 zig.exe
+        Start-Sleep -Seconds 2
+        $Zig命令 = Get-Command zig -ErrorAction SilentlyContinue
+        if ($Zig命令) {
+            $script:Zig路径 = $Zig命令.Source
+        } else {
+            $WingetPkg目录 = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages"
+            if (Test-Path $WingetPkg目录) {
+                $Zig文件 = Get-ChildItem $WingetPkg目录 -Directory -Filter "zig.zig_*" -ErrorAction SilentlyContinue |
+                    ForEach-Object { Get-ChildItem $_.FullName -Recurse -Filter "zig.exe" -ErrorAction SilentlyContinue } |
+                    Select-Object -First 1
+                if ($Zig文件) { $script:Zig路径 = $Zig文件.FullName }
+            }
+            if (-not $script:Zig路径) {
+                $链接路径 = "$env:LOCALAPPDATA\Microsoft\WinGet\Links\zig.exe"
+                if (Test-Path $链接路径) { $script:Zig路径 = $链接路径 }
+            }
+        }
+        if (-not $script:Zig路径) {
+            输出错误 "zig 安装后仍无法找到 zig.exe"
+            exit 1
+        }
+    }
+    # 确保 zig 所在目录在 PATH 中
+    $ZigBin目录 = Split-Path $script:Zig路径
+    if ($env:PATH -notlike "*$ZigBin目录*") {
+        $env:PATH = "$ZigBin目录;$env:PATH"
+    }
+    输出成功 "zig: $(& $script:Zig路径 version 2>&1)"
+
+    # cargo-zigbuild（使用 zig 作为 Rust 交叉编译 C linker）
+    if (-not (Get-Command cargo-zigbuild -ErrorAction SilentlyContinue)) {
+        $CargoZigbuild路径 = Join-Path $env:USERPROFILE ".cargo\bin\cargo-zigbuild.exe"
+        if (-not (Test-Path $CargoZigbuild路径)) {
+            输出步骤 "安装 cargo-zigbuild"
+            cargo install cargo-zigbuild 2>&1 | ForEach-Object {
+                if ($_ -match 'Compiling|Installing|Installed|^error') { Write-Host "  $_" }
+            }
+            if ($LASTEXITCODE -ne 0) {
+                输出错误 "cargo-zigbuild 安装失败"
+                exit 1
+            }
+        }
+    }
+    输出成功 "cargo-zigbuild: $(cargo zigbuild --version 2>&1)"
+
+    # Rust musl target（Alpine proot 环境需要 musl 链接的二进制）
+    $已安装Target = rustup target list --installed 2>&1
+    if ($已安装Target -notcontains "aarch64-unknown-linux-musl") {
+        Write-Host "  添加 Rust target: aarch64-unknown-linux-musl" -ForegroundColor DarkGray
+        rustup target add aarch64-unknown-linux-musl 2>&1 | ForEach-Object { Write-Host "  $_" }
+    }
+    输出成功 "Rust musl target: aarch64-unknown-linux-musl"
 }
 
 function 查找NDK目录 {
@@ -280,6 +361,12 @@ function 查找NDK工具链 {
 
 # ─── 子模块 URL 配置 ──────────────────────────────────────────────────
 $子模块名称列表 = @("Acode", "acodex-server", "acode-plugin-github")
+# 每个子模块工作树中用于判断"已正确检出"的关键文件（相对路径）
+$子模块校验文件 = @{
+    "Acode"               = "package.json"
+    "acodex-server"       = "Cargo.toml"
+    "acode-plugin-github" = "package.json"
+}
 
 $子模块原始URL = @{
     "Acode"               = "https://github.com/Ebola-Chan-bot/Acode.git"
@@ -302,11 +389,17 @@ function 恢复子模块URL {
 
 # ─── 强制清除子模块缓存 ───────────────────────────────────────────────
 function 强制清除子模块缓存 {
+    # 先终止可能持有文件锁的 git 进程
+    Get-Process git, git-remote-https -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+
     $原错误策略 = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     foreach ($名称 in $子模块名称列表) {
         git config --local --remove-section "submodule.$名称" 2>&1 | Out-Null
     }
     $ErrorActionPreference = $原错误策略
+
+    $未清除列表 = [System.Collections.Generic.List[string]]::new()
     foreach ($名称 in $子模块名称列表) {
         $Git缓存目录 = Join-Path $工作区根目录 ".git/modules/$名称"
         $工作目录    = Join-Path $工作区根目录 $名称
@@ -318,20 +411,17 @@ function 强制清除子模块缓存 {
                 if (Test-Path $目标) {
                     cmd /c "rd /s /q `"$目标`"" 2>&1 | Out-Null
                 }
+                if (Test-Path $目标) {
+                    $未清除列表.Add($目标)
+                }
             }
         }
     }
-    $模块总目录 = Join-Path $工作区根目录 ".git/modules"
-    if (Test-Path $模块总目录) {
-        Get-ChildItem $模块总目录 -Recurse -Force -ErrorAction SilentlyContinue |
-            ForEach-Object { try { $_.Attributes = 'Normal' } catch {} }
-        Remove-Item $模块总目录 -Recurse -Force -ErrorAction SilentlyContinue
-        if (Test-Path $模块总目录) {
-            cmd /c "rd /s /q `"$模块总目录`"" 2>&1 | Out-Null
-        }
-    }
-    if (Test-Path $模块总目录) {
-        输出错误 ".git/modules 无法完全清除（可能有文件被占用），请关闭 VS Code 后重试"
+
+    if ($未清除列表.Count -gt 0) {
+        输出错误 "以下目录无法清除（可能被 VS Code 或其他进程占用）："
+        foreach ($路径 in $未清除列表) { 输出错误 "  $路径" }
+        输出错误 "请关闭 VS Code 后重试"
         exit 1
     }
     输出成功 "已清除所有子模块缓存和工作目录"
@@ -474,7 +564,8 @@ function 竞速初始化子模块 {
             # 将子模块 .git 目录移入父仓库 .git/modules/<name>，使其成为正式子模块
             New-Item -ItemType Directory -Path (Split-Path $模块缓存目录) -Force | Out-Null
             Move-Item $子Git路径 $模块缓存目录 -Force
-            Set-Content (Join-Path $子目录 ".git") -Value "gitdir: ../.git/modules/$名称" -Encoding UTF8 -NoNewline
+            # 用 .NET 方法写入，避免 PowerShell 5 的 -Encoding UTF8 带 BOM 导致 git 无法解析
+            [System.IO.File]::WriteAllText((Join-Path $子目录 ".git"), "gitdir: ../.git/modules/$名称`n")
             git config -f (Join-Path $模块缓存目录 "config") "core.worktree" "../../../$名称" 2>&1 | Out-Null
         }
     }
@@ -488,19 +579,20 @@ function 初始化子模块 {
 
     Push-Location $工作区根目录
     try {
-        # 检查是否已全部就绪
+        # 检查是否已全部就绪：.git 存在 + 工作树有内容 + 关键文件存在
+        # 不使用 rev-parse HEAD，因为本地有修改时 submodule commit 引用可能失效
         $需要克隆 = $false
         foreach ($名称 in $子模块名称列表) {
             $子目录 = Join-Path $工作区根目录 $名称
             $有效   = $false
-            if (Test-Path $子目录) {
-                $原错误策略 = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-                git -C $子目录 rev-parse HEAD 2>&1 | Out-Null
-                if ($LASTEXITCODE -eq 0) { $有效 = $true }
-                $ErrorActionPreference = $原错误策略
+            if ((Test-Path $子目录) -and (Test-Path (Join-Path $子目录 ".git"))) {
+                $校验文件 = $子模块校验文件[$名称]
+                if ($校验文件 -and (Test-Path (Join-Path $子目录 $校验文件))) {
+                    $有效 = $true
+                }
             }
             if (-not $有效) {
-                输出警告 "子模块 '$名称' 缺失或损坏"
+                输出警告 "子模块 '$名称' 缺失或工作树不完整（缺少 $($子模块校验文件[$名称])）"
                 $需要克隆 = $true
                 break
             }
@@ -509,8 +601,53 @@ function 初始化子模块 {
         if (-not $需要克隆) {
             输出成功 "子模块已就绪，跳过克隆"
         } else {
-            强制清除子模块缓存
-            竞速初始化子模块
+            # 先尝试标准 git submodule update，限时 30 秒；超时或失败则切换到竞速克隆
+            $标准超时秒 = 30
+            输出步骤 "尝试标准 git submodule update --init（限时 ${标准超时秒}s）"
+            $标准Job = Start-Job -ScriptBlock {
+                param($工作目录)
+                Set-Location $工作目录
+                git submodule update --init --recursive 2>&1
+                # 用特殊标记行传递退出码，因为 Job 的 State 不反映进程退出码
+                Write-Output "___EXIT_CODE___:$LASTEXITCODE"
+            } -ArgumentList $工作区根目录
+            $标准完成 = $标准Job | Wait-Job -Timeout $标准超时秒
+            $更新退出码 = 1
+            if ($标准完成) {
+                $标准输出 = Receive-Job $标准Job
+                Remove-Job $标准Job -Force
+                foreach ($行 in $标准输出) {
+                    if ($行 -match '^___EXIT_CODE___:(\d+)$') {
+                        $更新退出码 = [int]$Matches[1]
+                    } else {
+                        Write-Host "  $行"
+                    }
+                }
+            } else {
+                输出警告 "标准 submodule update 超时（${标准超时秒}s），终止"
+                Stop-Job $标准Job -ErrorAction SilentlyContinue
+                Remove-Job $标准Job -Force -ErrorAction SilentlyContinue
+            }
+
+            # 验证每个子模块的关键文件是否存在
+            $仍需克隆 = $false
+            foreach ($名称 in $子模块名称列表) {
+                $子目录 = Join-Path $工作区根目录 $名称
+                $校验文件 = $子模块校验文件[$名称]
+                if (-not ($校验文件 -and (Test-Path (Join-Path $子目录 $校验文件)))) {
+                    输出警告 "子模块 '$名称' 工作树不完整（缺少 $校验文件）"
+                    $仍需克隆 = $true
+                    break
+                }
+            }
+
+            if ($仍需克隆) {
+                输出警告 "标准 submodule update 未能完全恢复，切换到竞速克隆"
+                强制清除子模块缓存
+                竞速初始化子模块
+            } else {
+                输出成功 "标准 submodule update 成功"
+            }
         }
 
         # 最终验证
@@ -735,21 +872,12 @@ function 设置Cordova平台 {
 
 # ─── 交叉编译 acodex-server ──────────────────────────────────────────
 function 编译AcodexServer {
-    输出步骤 "交叉编译 acodex-server → Android aarch64"
-
-    Write-Host "  添加 Rust target: aarch64-linux-android" -ForegroundColor DarkGray
-    rustup target add aarch64-linux-android 2>&1 | ForEach-Object { Write-Host "  $_" }
-
-    $NDK工具链 = 查找NDK工具链
-    $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = $NDK工具链.Clang路径
-    $env:CC_aarch64_linux_android  = $NDK工具链.Clang路径
-    $env:AR_aarch64_linux_android  = $NDK工具链.AR路径
-    输出成功 "NDK Clang: $($NDK工具链.Clang路径)"
+    输出步骤 "交叉编译 acodex-server → aarch64 musl (Alpine proot)"
 
     Push-Location $Acodex根目录
     try {
         Write-Host "  编译中（首次编译可能需要较长时间）..." -ForegroundColor DarkGray
-        cargo build --target aarch64-linux-android --release 2>&1 | ForEach-Object {
+        cargo zigbuild --target aarch64-unknown-linux-musl --release 2>&1 | ForEach-Object {
             if ($_ -match 'Compiling|Finished|^error|ld\.lld:|warning:') { Write-Host "  $_" }
         }
         if ($LASTEXITCODE -ne 0) {
@@ -757,7 +885,7 @@ function 编译AcodexServer {
             exit 1
         }
 
-        $Axs二进制 = Join-Path $Acodex根目录 "target/aarch64-linux-android/release/axs"
+        $Axs二进制 = Join-Path $Acodex根目录 "target/aarch64-unknown-linux-musl/release/axs"
         if (-not (Test-Path $Axs二进制)) {
             输出错误 "编译产物不存在: $Axs二进制"
             exit 1
@@ -778,11 +906,16 @@ function 同步资产 {
         exit 1
     }
 
-    $Axs二进制 = Join-Path $Acodex根目录 "target/aarch64-linux-android/release/axs"
-    if (Test-Path $Axs二进制) {
+    $Axs二进制 = Join-Path $Acodex根目录 "target/aarch64-unknown-linux-musl/release/axs"
+    if ($构建模式 -eq "release") {
+        # Release builds: remove bundled axs to reduce APK size (app downloads latest)
+        $嵌入Axs = Join-Path $平台Assets目录 "axs"
+        if (Test-Path $嵌入Axs) { Remove-Item $嵌入Axs -Force }
+        输出成功 "release 模式：跳过 axs 嵌入（应用将从网络下载）"
+    } elseif (Test-Path $Axs二进制) {
         Copy-Item $Axs二进制 (Join-Path $平台Assets目录 "axs") -Force
         $大小MB = [math]::Round((Get-Item $Axs二进制).Length / 1MB, 1)
-        输出成功 "axs ($大小MB MB) → assets/axs"
+        输出成功 "axs ($大小MB MB) → assets/axs（debug 嵌入）"
     } else {
         输出警告 "axs 二进制不存在，跳过（请先执行 -动作 build-server）"
     }
@@ -905,17 +1038,29 @@ function 注入调试客户端 {
         return
     }
 
-    # 检测局域网IP
+    # 检测局域网IP（优先 WLAN/以太网等实际物理网卡，排除虚拟网卡和移动热点）
     $候选 = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
         $_.PrefixOrigin -ne "WellKnown" -and
         $_.IPAddress -notmatch '^169\.254\.' -and
-        $_.InterfaceAlias -notmatch 'Loopback|vEthernet|Hyper-V|WSL|VirtualBox|VMware|isatap|Teredo|Bluetooth'
+        $_.IPAddress -ne '127.0.0.1' -and
+        $_.InterfaceAlias -notmatch 'Loopback|vEthernet|Hyper-V|WSL|VirtualBox|VMware|isatap|Teredo|Bluetooth|本地连接\*'
     }
+    # 优先选择 WLAN / Wi-Fi / 以太网等实际物理网卡（DHCP 分配的地址更可靠）
     $内网IP = ($候选 | Where-Object {
-        $_.IPAddress -match '^192\.168\.' -or $_.IPAddress -match '^10\.' -or
-        $_.IPAddress -match '^172\.(1[6-9]|2[0-9]|3[0-1])\.'
+        $_.InterfaceAlias -match 'WLAN|Wi-Fi|以太网|Ethernet' -and $_.PrefixOrigin -eq 'Dhcp'
     } | Select-Object -First 1).IPAddress
-    if (-not $内网IP) { $内网IP = ($候选 | Select-Object -First 1).IPAddress }
+    if (-not $内网IP) {
+        # fallback：任意 DHCP 分配的私有 IP
+        $内网IP = ($候选 | Where-Object {
+            $_.PrefixOrigin -eq 'Dhcp' -and (
+                $_.IPAddress -match '^192\.168\.' -or $_.IPAddress -match '^10\.' -or
+                $_.IPAddress -match '^172\.(1[6-9]|2[0-9]|3[0-1])\.'
+            )
+        } | Select-Object -First 1).IPAddress
+    }
+    if (-not $内网IP) {
+        $内网IP = ($候选 | Select-Object -First 1).IPAddress
+    }
     if (-not $内网IP) { $内网IP = "127.0.0.1" }
 
     $调试端口 = 8092
