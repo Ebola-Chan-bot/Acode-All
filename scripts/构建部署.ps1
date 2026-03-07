@@ -33,6 +33,9 @@
 .PARAMETER NDK接口级别
   NDK 编译使用的最低 Android API 等级（默认 21）
 
+.PARAMETER 启用调试客户端
+    是否向构建产物注入局域网调试客户端脚本（默认关闭）
+
 .EXAMPLE
   .\构建部署.ps1                               # 完整流程
   .\构建部署.ps1 -动作 setup                  # 仅初始化环境
@@ -41,6 +44,7 @@
   .\构建部署.ps1 -动作 deploy                 # 仅推送 APK
   .\构建部署.ps1 -设备模式 hdc                # 使用 HDC 连接华为设备
   .\构建部署.ps1 -构建模式 release            # 构建 release 版
+    .\构建部署.ps1 -动作 build-apk -启用调试客户端 # 构建带调试服务器注入的 debug 包
   .\构建部署.ps1 -动作 clean                  # 清理构建产物
 #>
 
@@ -56,6 +60,8 @@ param(
 
     [ValidateSet("paid", "free")]
     [string]$应用类型 = "paid",
+
+    [switch]$启用调试客户端,
 
     [int]$NDK接口级别 = 28
 )
@@ -295,13 +301,57 @@ function 初始化构建环境 {
             }
         }
     }
-    输出成功 "cargo-zigbuild: $(cargo zigbuild --version 2>&1)"
+    $CargoZigbuild版本 = & cargo-zigbuild --version 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        输出错误 "cargo-zigbuild 不可用: $CargoZigbuild版本"
+        exit 1
+    }
+    输出成功 "cargo-zigbuild: $CargoZigbuild版本"
 
     # Rust musl target（Alpine proot 环境需要 musl 链接的二进制）
     $已安装Target = rustup target list --installed 2>&1
     if ($已安装Target -notcontains "aarch64-unknown-linux-musl") {
         Write-Host "  添加 Rust target: aarch64-unknown-linux-musl" -ForegroundColor DarkGray
         rustup target add aarch64-unknown-linux-musl 2>&1 | ForEach-Object { Write-Host "  $_" }
+
+        # 某些环境曾通过镜像拉取过 stable manifest，component URL 会被缓存为绝对地址。
+        # 仅设置环境变量不够，必须先用官方源刷新 manifest，再重新安装 target。
+        $验证Target = rustup target list --installed 2>&1
+        if ($验证Target -notcontains "aarch64-unknown-linux-musl") {
+            输出警告 "镜像下载失败，临时使用官方源刷新工具链并重试"
+            $原RUSTUP_DIST_SERVER = $env:RUSTUP_DIST_SERVER
+            $原RUSTUP_UPDATE_ROOT = $env:RUSTUP_UPDATE_ROOT
+            $env:RUSTUP_DIST_SERVER = "https://static.rust-lang.org"
+            $env:RUSTUP_UPDATE_ROOT = "https://static.rust-lang.org/rustup"
+
+            rustup update stable 2>&1 | ForEach-Object { Write-Host "  $_" }
+            if ($LASTEXITCODE -ne 0) {
+                $env:RUSTUP_DIST_SERVER = $原RUSTUP_DIST_SERVER
+                $env:RUSTUP_UPDATE_ROOT = $原RUSTUP_UPDATE_ROOT
+                输出错误 "官方源刷新 stable 工具链失败"
+                exit 1
+            }
+
+            rustup target add aarch64-unknown-linux-musl 2>&1 | ForEach-Object { Write-Host "  $_" }
+
+            # 恢复镜像设置
+            if ($null -eq $原RUSTUP_DIST_SERVER) {
+                Remove-Item Env:RUSTUP_DIST_SERVER -ErrorAction SilentlyContinue
+            } else {
+                $env:RUSTUP_DIST_SERVER = $原RUSTUP_DIST_SERVER
+            }
+            if ($null -eq $原RUSTUP_UPDATE_ROOT) {
+                Remove-Item Env:RUSTUP_UPDATE_ROOT -ErrorAction SilentlyContinue
+            } else {
+                $env:RUSTUP_UPDATE_ROOT = $原RUSTUP_UPDATE_ROOT
+            }
+
+            $验证Target = rustup target list --installed 2>&1
+            if ($验证Target -notcontains "aarch64-unknown-linux-musl") {
+                输出错误 "aarch64-unknown-linux-musl target 安装失败（镜像和官方源均失败）"
+                exit 1
+            }
+        }
     }
     输出成功 "Rust musl target: aarch64-unknown-linux-musl"
 }
@@ -1030,11 +1080,28 @@ function 同步插件资产 {
 
 # ─── 注入调试客户端 ───────────────────────────────────────────────────
 function 注入调试客户端 {
-    if ($构建模式 -eq "release") { return }
-
     $平台IndexHtml = Join-Path $平台AssetsWww "index.html"
     if (-not (Test-Path $平台IndexHtml)) {
         输出警告 "平台 index.html 不存在，跳过调试客户端注入"
+        return
+    }
+
+    $内容 = Get-Content $平台IndexHtml -Raw -Encoding UTF8
+
+    # 先清理旧注入，避免上一次构建残留到当前产物。
+    if ($内容 -match "HDC_DEBUG") {
+        $内容 = $内容 -replace '(?s)\s*<!-- HDC_DEBUG -->.*?</script>\s*', "`n"
+        [System.IO.File]::WriteAllText($平台IndexHtml, $内容, [System.Text.UTF8Encoding]::new($false))
+        输出警告 "已清除旧版调试注入"
+    }
+
+    if ($构建模式 -eq "release") {
+        输出成功 "release 构建默认不注入调试客户端"
+        return
+    }
+
+    if (-not $启用调试客户端) {
+        输出成功 "未启用调试客户端注入，构建产物不依赖调试服务器"
         return
     }
 
@@ -1065,14 +1132,6 @@ function 注入调试客户端 {
 
     $调试端口 = 8092
     $调试脚本标签 = "    <!-- HDC_DEBUG --><script src=`"http://${内网IP}:${调试端口}/__debug_client.js`"></script>"
-
-    $内容 = Get-Content $平台IndexHtml -Raw -Encoding UTF8
-
-    # 清除旧版调试注入（可能是内联脚本块）
-    if ($内容 -match "HDC_DEBUG") {
-        $内容 = $内容 -replace '(?s)\s*<!-- HDC_DEBUG -->.*?</script>\s*', "`n"
-        输出警告 "已清除旧版调试注入"
-    }
 
     # 在 cordova.js 之前插入
     $内容 = $内容 -replace '(\s*<script src="cordova\.js"></script>)', "`n$调试脚本标签`n`$1"
