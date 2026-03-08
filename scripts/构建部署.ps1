@@ -17,7 +17,7 @@
     full         = 完整流程（首次使用推荐）
     setup        = 仅初始化环境和依赖
     build-server = 仅编译 acodex-server
-    build-apk    = 仅构建 APK（跳过 Rust 编译）
+        build-apk    = 仅构建 APK（debug 缺少 axs 时会自动补编译）
     deploy       = 仅推送已构建的 APK 到手机
     clean        = 清理构建产物
 
@@ -105,6 +105,63 @@ function 获取应用信息 {
     if ([string]::IsNullOrWhiteSpace($名称)) { $名称 = "app-debug" }
     if ([string]::IsNullOrWhiteSpace($版本)) { $版本 = "0.0.0" }
     return @{ 名称 = $名称; 版本 = $版本 }
+}
+
+function 获取Acode应用类型 {
+    if (-not (Test-Path $配置XML路径)) {
+        return "paid"
+    }
+
+    [xml]$配置文档 = Get-Content $配置XML路径 -Encoding UTF8
+    $应用ID = $配置文档.widget.id
+    if ($应用ID -eq "com.foxdebug.acodefree") {
+        return "free"
+    }
+
+    return "paid"
+}
+
+function 获取Acode源码状态快照 {
+    $状态输出 = git -C $Acode根目录 status --porcelain=v1 --untracked-files=no 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        return @()
+    }
+
+    return @($状态输出 | Where-Object {
+        $_ -and
+        $_ -notmatch '^\?\?' -and
+        $_ -notmatch '^..\s+platforms/' -and
+        $_ -notmatch '^..\s+www/build/'
+    })
+}
+
+function 开始源码保护 {
+    $当前应用类型 = 获取Acode应用类型
+    if ($当前应用类型 -ne $应用类型) {
+        输出错误 "自动构建不会改写 Acode 源码来切换应用类型。"
+        输出错误 "当前源码应用类型: $当前应用类型；请求构建类型: $应用类型"
+        输出错误 "请先在独立工作副本中完成类型切换，再重新构建。"
+        exit 1
+    }
+
+    $script:Acode源码状态基线 = 获取Acode源码状态快照
+    输出成功 "已记录构建前的 Acode 源码状态"
+}
+
+function 验证源码未被修改 {
+    $当前快照 = 获取Acode源码状态快照
+    $基线快照 = @($script:Acode源码状态基线)
+
+    $差异 = Compare-Object -ReferenceObject $基线快照 -DifferenceObject $当前快照
+    if ($差异) {
+        输出错误 "构建流程修改了 Acode 源码状态，这不符合脚本约束。差异如下："
+        foreach ($项 in $差异) {
+            输出错误 "  $($项.SideIndicator) $($项.InputObject)"
+        }
+        exit 1
+    }
+
+    输出成功 "构建流程未修改 Acode 源码状态"
 }
 
 # ─── 环境检测与自动配置 ───────────────────────────────────────────────
@@ -947,6 +1004,22 @@ function 编译AcodexServer {
     }
 }
 
+function 确保DebugAxs可用 {
+    if ($构建模式 -ne "debug") {
+        return
+    }
+
+    $Axs二进制 = Join-Path $Acodex根目录 "target/aarch64-unknown-linux-musl/release/axs"
+    if (Test-Path $Axs二进制) {
+        $大小MB = [math]::Round((Get-Item $Axs二进制).Length / 1MB, 1)
+        输出成功 "检测到现有 axs 编译产物 ($大小MB MB)"
+        return
+    }
+
+    输出警告 "debug 模式需要嵌入 axs，当前未检测到编译产物，自动触发 build-server"
+    编译AcodexServer
+}
+
 # ─── 同步资产到平台目录 ───────────────────────────────────────────────
 function 同步资产 {
     输出步骤 "同步资产到 Android 平台目录"
@@ -967,7 +1040,8 @@ function 同步资产 {
         $大小MB = [math]::Round((Get-Item $Axs二进制).Length / 1MB, 1)
         输出成功 "axs ($大小MB MB) → assets/axs（debug 嵌入）"
     } else {
-        输出警告 "axs 二进制不存在，跳过（请先执行 -动作 build-server）"
+        输出错误 "debug 模式要求嵌入 axs，但编译产物仍不存在: $Axs二进制"
+        exit 1
     }
 
     $Shell脚本列表 = @(
@@ -1167,7 +1241,7 @@ function 构建前端 {
         $Rspack模式 = if ($构建模式 -eq "release") { "production" } else { "development" }
 
         Write-Host "  配置: mode=$配置模式 app=$应用类型" -ForegroundColor DarkGray
-        node ./utils/config.js $配置模式 $应用类型 2>&1 | ForEach-Object { Write-Host "  $_" }
+        输出成功 "跳过 utils/config.js，自动构建不修改 Acode 源码"
 
         Write-Host "  rspack 构建 (mode=$Rspack模式)..." -ForegroundColor DarkGray
         npx rspack --mode $Rspack模式 2>&1 | ForEach-Object { Write-Host "  $_" }
@@ -1396,11 +1470,14 @@ switch ($动作) {
 
     "build-apk" {
         初始化构建环境
+        开始源码保护
         设置Cordova平台
+        确保DebugAxs可用
         构建前端
         同步资产
         注入调试客户端
         构建APK
+        验证源码未被修改
     }
 
     "deploy" {
@@ -1415,12 +1492,17 @@ switch ($动作) {
         初始化构建环境
         初始化子模块
         安装Node依赖
+        开始源码保护
         设置Cordova平台
-        编译AcodexServer
+        确保DebugAxs可用
+        if ($构建模式 -eq "release") {
+            编译AcodexServer
+        }
         构建前端
         同步资产
         注入调试客户端
         $APK文件 = 构建APK
+        验证源码未被修改
         部署APK -APK路径 $APK文件
 
         Write-Host ""
