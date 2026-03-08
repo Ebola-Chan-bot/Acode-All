@@ -261,7 +261,7 @@ function 初始化构建环境 {
             exit 1
         }
         Write-Host "  安装 build-tools;$最新可用版 ..." -ForegroundColor DarkGray
-        echo "y" | & $SDK管理器 "build-tools;$最新可用版" 2>&1 | ForEach-Object { Write-Host "  $_" }
+        Write-Output "y" | & $SDK管理器 "build-tools;$最新可用版" 2>&1 | ForEach-Object { Write-Host "  $_" }
         $已安装最新版 = Get-ChildItem $BuildTools目录 -Directory |
             Where-Object { $_.Name -match '^\d+\.\d+\.\d+$' } |
             Sort-Object { [version]$_.Name } -Descending |
@@ -274,6 +274,47 @@ function 初始化构建环境 {
     $BuildTools最新版 = $已安装最新版.Name
     输出成功 "Android Build Tools 最新版: $BuildTools最新版"
     $script:BuildTools最新版 = $BuildTools最新版
+
+    $Gradle命令 = Get-Command gradle -ErrorAction SilentlyContinue
+    if ($Gradle命令) {
+        $script:Gradle路径 = $Gradle命令.Source
+    } else {
+        $Gradle候选列表 = @(
+            (Get-ChildItem (Join-Path $env:USERPROFILE ".gradle\wrapper\dists") -Recurse -Filter "gradle.bat" -ErrorAction SilentlyContinue |
+                Sort-Object FullName -Descending |
+                Select-Object -ExpandProperty FullName),
+            (Get-ChildItem "C:\Program Files\Android\Android Studio" -Recurse -Filter "gradle.bat" -ErrorAction SilentlyContinue |
+                Sort-Object FullName -Descending |
+                Select-Object -ExpandProperty FullName)
+        ) | Where-Object { $_ }
+
+        $script:Gradle路径 = $Gradle候选列表 | Select-Object -First 1
+    }
+
+    if (-not $script:Gradle路径) {
+        输出步骤 "安装 Gradle（Cordova Android 构建所需）"
+        if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+            输出错误 "找不到可用的 Gradle，且 winget 不可用，请先安装 Gradle 或 Android Studio"
+            exit 1
+        }
+
+        winget install Gradle.Gradle --accept-source-agreements --accept-package-agreements --silent 2>&1 | ForEach-Object { Write-Host "  $_" }
+        $Gradle命令 = Get-Command gradle -ErrorAction SilentlyContinue
+        if ($Gradle命令) {
+            $script:Gradle路径 = $Gradle命令.Source
+        }
+    }
+
+    if (-not $script:Gradle路径) {
+        输出错误 "Gradle 安装后仍不可用"
+        exit 1
+    }
+
+    $GradleBin目录 = Split-Path $script:Gradle路径
+    if ($env:PATH -notlike "*$GradleBin目录*") {
+        $env:PATH = "$GradleBin目录;$env:PATH"
+    }
+    输出成功 "Gradle: $(& $script:Gradle路径 --version 2>&1 | Select-Object -First 1)"
 
     # Rust 工具链（可能不在 PATH 中，自动检测 ~/.cargo/bin）
     if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
@@ -721,13 +762,12 @@ function 初始化子模块 {
                 Write-Output "___EXIT_CODE___:$LASTEXITCODE"
             } -ArgumentList $工作区根目录
             $标准完成 = $标准Job | Wait-Job -Timeout $标准超时秒
-            $更新退出码 = 1
             if ($标准完成) {
                 $标准输出 = Receive-Job $标准Job
                 Remove-Job $标准Job -Force
                 foreach ($行 in $标准输出) {
                     if ($行 -match '^___EXIT_CODE___:(\d+)$') {
-                        $更新退出码 = [int]$Matches[1]
+                        $null = [int]$Matches[1]
                     } else {
                         Write-Host "  $行"
                     }
@@ -849,6 +889,79 @@ function 安装Node依赖 {
     }
 }
 
+function 获取CordovaAndroid版本约束 {
+    $PackageJson路径 = Join-Path $Acode根目录 "package.json"
+    if (-not (Test-Path $PackageJson路径)) {
+        return $null
+    }
+
+    try {
+        $PackageJson = Get-Content $PackageJson路径 -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+        $版本约束 = [string]$PackageJson.devDependencies."cordova-android"
+        if ([string]::IsNullOrWhiteSpace($版本约束)) {
+            return $null
+        }
+        return $版本约束.Trim()
+    } catch {
+        return $null
+    }
+}
+
+function 获取已安装Gradle目录([string]$Gradle版本) {
+    if ([string]::IsNullOrWhiteSpace($Gradle版本)) {
+        return $null
+    }
+
+    $Gradle根目录名 = "gradle-$Gradle版本"
+    $候选目录 = @(
+        (Get-ChildItem (Join-Path $env:USERPROFILE ".gradle\wrapper\dists\gradle-$Gradle版本-bin") -Recurse -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -eq $Gradle根目录名 } |
+            Sort-Object FullName -Descending |
+            Select-Object -ExpandProperty FullName),
+        (Get-ChildItem "C:\Program Files\Android\Android Studio" -Recurse -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -eq $Gradle根目录名 } |
+            Sort-Object FullName -Descending |
+            Select-Object -ExpandProperty FullName)
+    ) | Where-Object { $_ }
+
+    return $候选目录 | Select-Object -First 1
+}
+
+function 转换为FileUrl([string]$文件路径) {
+    return [System.Uri]::new((Resolve-Path $文件路径)).AbsoluteUri
+}
+
+function 重建CordovaAndroid平台 {
+    $已存在平台 = Test-Path $平台根目录
+    $CordovaAndroid版本约束 = 获取CordovaAndroid版本约束
+    $平台包 = if ([string]::IsNullOrWhiteSpace($CordovaAndroid版本约束)) {
+        "android"
+    } else {
+        "android@$CordovaAndroid版本约束"
+    }
+
+    if ($已存在平台) {
+        输出步骤 "重建 Cordova Android 平台"
+        Write-Host "  移除 Android 平台..." -ForegroundColor DarkGray
+        npx cordova platform remove android --nosave 2>&1 | ForEach-Object { Write-Host "  $_" }
+        if ($LASTEXITCODE -ne 0) {
+            输出错误 "cordova platform remove android 失败"
+            exit 1
+        }
+    } else {
+        输出步骤 "初始化 Cordova Android 平台"
+    }
+
+    Write-Host "  添加 Android 平台: $平台包" -ForegroundColor DarkGray
+    npx cordova platform add $平台包 --nosave 2>&1 | ForEach-Object { Write-Host "  $_" }
+    if ($LASTEXITCODE -ne 0) {
+        输出错误 "cordova platform add android 失败"
+        exit 1
+    }
+
+    输出成功 "Android 平台已按当前插件源码重建"
+}
+
 # ─── Cordova 平台设置 ─────────────────────────────────────────────────
 function 设置Cordova平台 {
     输出步骤 "设置 Cordova Android 平台"
@@ -866,38 +979,7 @@ function 设置Cordova平台 {
         Set-Content (Join-Path $env:TMPDIR "fdroid.bool") -Value "false" -NoNewline
         输出成功 "fdroid.bool=false → targetSdkVersion=35"
 
-        if (-not (Test-Path $平台根目录)) {
-            Write-Host "  添加 Android 平台..." -ForegroundColor DarkGray
-            npx cordova platform add android 2>&1 | ForEach-Object { Write-Host "  $_" }
-            if ($LASTEXITCODE -ne 0) {
-                输出错误 "cordova platform add android 失败"
-                exit 1
-            }
-            输出成功 "Android 平台已添加"
-
-            $核心插件列表 = @("cordova-plugin-buildinfo", "cordova-plugin-device", "cordova-plugin-file")
-            foreach ($插件 in $核心插件列表) {
-                Write-Host "  安装插件: $插件" -ForegroundColor DarkGray
-                npx cordova plugin add $插件 2>&1 | Out-Null
-            }
-
-            $插件目录 = Join-Path $Acode根目录 "src/plugins"
-            if (Test-Path $插件目录) {
-                Get-ChildItem $插件目录 -Directory | ForEach-Object {
-                    if (-not $_.Name.StartsWith('.')) {
-                        Write-Host "  安装插件: $($_.Name)" -ForegroundColor DarkGray
-                        try {
-                            npx cordova plugin add "./src/plugins/$($_.Name)" 2>&1 | Out-Null
-                        } catch {
-                            输出警告 "插件 $($_.Name) 安装失败（可能已安装），继续..."
-                        }
-                    }
-                }
-            }
-            输出成功 "插件安装完成"
-        } else {
-            输出成功 "Android 平台已存在，跳过初始化"
-        }
+        重建CordovaAndroid平台
 
         Write-Host "  Cordova prepare..." -ForegroundColor DarkGray
         npx cordova prepare android 2>&1 | ForEach-Object { Write-Host "  $_" }
@@ -1037,7 +1119,7 @@ function 构建前端 {
         $Rspack模式 = if ($构建模式 -eq "release") { "production" } else { "development" }
 
         Write-Host "  配置: mode=$配置模式 app=$应用类型" -ForegroundColor DarkGray
-        输出成功 "跳过 utils/config.js，自动构建不修改 Acode 源码"
+        输出成功 "默认不调用 utils/config.js；如需切换应用类型，需走 Acode 内置配置接口"
 
         Write-Host "  rspack 构建 (mode=$Rspack模式)..." -ForegroundColor DarkGray
         npx rspack --mode $Rspack模式 2>&1 | ForEach-Object { Write-Host "  $_" }
@@ -1052,31 +1134,38 @@ function 构建前端 {
 }
 
 # ─── Gradle 构建 APK ──────────────────────────────────────────────────
-function 构建APK {
-    输出步骤 "Gradle 构建 APK"
-
-    if (-not (Test-Path $Gradlew路径)) {
-        输出错误 "找不到 gradlew.bat: $Gradlew路径"
-        输出错误 "请先运行: .\构建部署.ps1 -动作 setup"
+function 使用本机Gradle构建APK {
+    if (-not $script:Gradle路径 -or -not (Test-Path $script:Gradle路径)) {
+        输出错误 "本机 Gradle 不可用，无法执行 APK 构建"
         exit 1
     }
 
-    $Gradle任务 = if ($构建模式 -eq "release") { "assembleRelease" } else { "assembleDebug" }
-    $输出目录   = if ($构建模式 -eq "release") { $发布APK输出目录 } else { $调试APK输出目录 }
-    $Gradle参数 = @($Gradle任务)
+    $Gradle任务 = if ($构建模式 -eq "release") { "cdvBuildRelease" } else { "cdvBuildDebug" }
+    $Gradle参数 = @("-p", $平台根目录)
     if ($script:BuildTools最新版) {
         $Gradle参数 += "-PcdvBuildToolsVersion=$($script:BuildTools最新版)"
+    }
+    $Gradle参数 += $Gradle任务
+
+    输出成功 "使用本机 Gradle: $script:Gradle路径"
+    & $script:Gradle路径 @Gradle参数 2>&1 | ForEach-Object { Write-Host "  $_" }
+    if ($LASTEXITCODE -ne 0) {
+        输出错误 "本机 Gradle 构建失败 (exit code: $LASTEXITCODE)"
+        exit 1
+    }
+}
+
+function 构建APK {
+    输出步骤 "Gradle 构建 APK"
+
+    $输出目录   = if ($构建模式 -eq "release") { $发布APK输出目录 } else { $调试APK输出目录 }
+    if ($script:BuildTools最新版) {
         输出成功 "使用运行时 Build Tools 版本: $($script:BuildTools最新版)"
     }
 
-    Push-Location (Split-Path $Gradlew路径)
+    Push-Location $Acode根目录
     try {
-        # 直接运行，不经过 pipeline——避免 Gradle Daemon 持有管道句柄导致卡死
-        & $Gradlew路径 @Gradle参数
-        if ($LASTEXITCODE -ne 0) {
-            输出错误 "Gradle 构建失败 (exit code: $LASTEXITCODE)"
-            exit 1
-        }
+        使用本机Gradle构建APK
     } finally {
         Pop-Location
     }
