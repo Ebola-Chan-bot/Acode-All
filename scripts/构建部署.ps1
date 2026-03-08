@@ -70,17 +70,23 @@ $ErrorActionPreference = "Continue"
 
 # ─── 路径配置 ─────────────────────────────────────────────────────────
 $工作区根目录     = Resolve-Path (Join-Path $PSScriptRoot "..")
-$Acode根目录      = Join-Path $工作区根目录 "Acode"
+$Acode源码根目录  = Join-Path $工作区根目录 "Acode"
 $Acodex根目录     = Join-Path $工作区根目录 "acodex-server"
-$平台根目录       = Join-Path $Acode根目录 "platforms/android"
-$平台Assets目录   = Join-Path $平台根目录 "app/src/main/assets"
-$平台AssetsWww    = Join-Path $平台Assets目录 "www"
-$Gradlew路径      = Join-Path $平台根目录 "gradlew.bat"
-$调试APK输出目录  = Join-Path $平台根目录 "app/build/outputs/apk/debug"
-$发布APK输出目录  = Join-Path $平台根目录 "app/build/outputs/apk/release"
-$配置XML路径      = Join-Path $Acode根目录 "config.xml"
-$Www目录          = Join-Path $Acode根目录 "www"
 $HDC程序路径      = "C:\Program Files (x86)\HiSuite\hwtools\hdc.exe"
+
+function 更新Acode工作目录([string]$根目录) {
+    $script:Acode根目录     = $根目录
+    $script:平台根目录      = Join-Path $根目录 "platforms/android"
+    $script:平台Assets目录  = Join-Path $script:平台根目录 "app/src/main/assets"
+    $script:平台AssetsWww   = Join-Path $script:平台Assets目录 "www"
+    $script:Gradlew路径     = Join-Path $script:平台根目录 "gradlew.bat"
+    $script:调试APK输出目录 = Join-Path $script:平台根目录 "app/build/outputs/apk/debug"
+    $script:发布APK输出目录 = Join-Path $script:平台根目录 "app/build/outputs/apk/release"
+    $script:配置XML路径     = Join-Path $根目录 "config.xml"
+    $script:Www目录         = Join-Path $根目录 "www"
+}
+
+更新Acode工作目录 $Acode源码根目录
 
 # ─── 工具函数 ─────────────────────────────────────────────────────────
 function 输出步骤($消息) { Write-Host "`n▶ $消息" -ForegroundColor Cyan }
@@ -108,11 +114,12 @@ function 获取应用信息 {
 }
 
 function 获取Acode应用类型 {
-    if (-not (Test-Path $配置XML路径)) {
+    $源码配置XML路径 = Join-Path $Acode源码根目录 "config.xml"
+    if (-not (Test-Path $源码配置XML路径)) {
         return "paid"
     }
 
-    [xml]$配置文档 = Get-Content $配置XML路径 -Encoding UTF8
+    [xml]$配置文档 = Get-Content $源码配置XML路径 -Encoding UTF8
     $应用ID = $配置文档.widget.id
     if ($应用ID -eq "com.foxdebug.acodefree") {
         return "free"
@@ -122,17 +129,12 @@ function 获取Acode应用类型 {
 }
 
 function 获取Acode源码状态快照 {
-    $状态输出 = git -C $Acode根目录 status --porcelain=v1 --untracked-files=no 2>$null
+    $状态输出 = git -C $Acode源码根目录 status --porcelain=v1 --untracked-files=all 2>$null
     if ($LASTEXITCODE -ne 0) {
         return @()
     }
 
-    return @($状态输出 | Where-Object {
-        $_ -and
-        $_ -notmatch '^\?\?' -and
-        $_ -notmatch '^..\s+platforms/' -and
-        $_ -notmatch '^..\s+www/build/'
-    })
+    return @($状态输出 | Where-Object { $_ })
 }
 
 function 开始源码保护 {
@@ -144,24 +146,24 @@ function 开始源码保护 {
         exit 1
     }
 
-    $script:Acode源码状态基线 = 获取Acode源码状态快照
-    输出成功 "已记录构建前的 Acode 源码状态"
+    $script:Acode源码状态基线 = @(获取Acode源码状态快照)
+    输出成功 "已记录构建前的 Acode git 状态基线"
 }
 
 function 验证源码未被修改 {
-    $当前快照 = 获取Acode源码状态快照
-    $基线快照 = @($script:Acode源码状态基线)
+    $当前快照 = @(获取Acode源码状态快照 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $基线快照 = @($script:Acode源码状态基线 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 
     $差异 = Compare-Object -ReferenceObject $基线快照 -DifferenceObject $当前快照
     if ($差异) {
-        输出错误 "构建流程修改了 Acode 源码状态，这不符合脚本约束。差异如下："
+        输出错误 "构建流程产生了 git 可见的 Acode 仓库污染，这不符合脚本约束。差异如下："
         foreach ($项 in $差异) {
             输出错误 "  $($项.SideIndicator) $($项.InputObject)"
         }
         exit 1
     }
 
-    输出成功 "构建流程未修改 Acode 源码状态"
+    输出成功 "构建流程未产生 git 可见的 Acode 仓库改动"
 }
 
 # ─── 环境检测与自动配置 ───────────────────────────────────────────────
@@ -900,78 +902,6 @@ function 设置Cordova平台 {
         Write-Host "  Cordova prepare..." -ForegroundColor DarkGray
         npx cordova prepare android 2>&1 | ForEach-Object { Write-Host "  $_" }
         输出成功 "Cordova prepare 完成"
-
-        # ── 向 cdv-gradle-config.json 写入 BUILD_TOOLS_VERSION，绕过动态搜索逻辑 ──
-        # cordova.gradle 的 doFindLatestInstalledBuildTools(MIN_BUILD_TOOLS_VERSION) 搜索范围是
-        # [minMajor.0.0, (minMajor+1).0.0)，若本机只装了 (minMajor+1).x.x 则搜不到。
-        # 直接设置 BUILD_TOOLS_VERSION 后，Groovy 代码中 if (!cordovaConfig.BUILD_TOOLS_VERSION)
-        # 分支不会执行，完全绕开该问题。
-        if ($script:BuildTools最新版) {
-            $Cdv配置文件 = Join-Path $平台根目录 "cdv-gradle-config.json"
-            if (Test-Path $Cdv配置文件) {
-                $Cdv配置对象 = Get-Content $Cdv配置文件 -Raw -Encoding UTF8 | ConvertFrom-Json
-                $Cdv配置对象 | Add-Member -Name "BUILD_TOOLS_VERSION" -Value $script:BuildTools最新版 -MemberType NoteProperty -Force
-                $Cdv配置对象 | ConvertTo-Json -Depth 10 | Set-Content $Cdv配置文件 -Encoding UTF8
-                输出成功 "cdv-gradle-config.json BUILD_TOOLS_VERSION → $($script:BuildTools最新版)"
-            }
-        }
-
-        # ── 将 Cordova Scheme 改为 http，允许 ws:// WebSocket 连接 ──
-        # 默认 Cordova 使用 https scheme 加载页面（安全上下文），会阻止 ws:// 连接
-        $平台ConfigXml = Join-Path $平台根目录 "app\src\main\res\xml\config.xml"
-        if (Test-Path $平台ConfigXml) {
-            $配置内容 = Get-Content $平台ConfigXml -Raw -Encoding UTF8
-            if ($配置内容 -notmatch '<preference name="Scheme" value="http"') {
-                $配置内容 = $配置内容 -replace '(?m)^\s*<preference name="Scheme" value="[^"]*"\s*/>\s*\r?\n?', ''
-                $配置内容 = $配置内容 -replace '</widget>', "    <preference name=`"Scheme`" value=`"http`" />`n</widget>"
-                Set-Content $平台ConfigXml -Value $配置内容 -Encoding UTF8 -NoNewline
-                输出成功 "已设置 Cordova Scheme=http（允许 ws:// 连接）"
-            }
-        }
-
-        # ── 生成 Gradle wrapper（gitignored，需手动生成）──
-        if (-not (Test-Path $Gradlew路径)) {
-            Write-Host "  生成 Gradle wrapper..." -ForegroundColor DarkGray
-            $Gradle配置 = Get-Content (Join-Path $平台根目录 "cdv-gradle-config.json") -Raw | ConvertFrom-Json
-            $Gradle版本  = $Gradle配置.GRADLE_VERSION
-
-            # 从 ~/.gradle/wrapper/dists 中找已下载的 Gradle
-            $Gradle发行目录 = Join-Path $env:USERPROFILE ".gradle\wrapper\dists"
-            $Gradle可执行 = Get-ChildItem $Gradle发行目录 -Recurse -Filter "gradle.bat" -ErrorAction SilentlyContinue |
-                Where-Object { $_.FullName -match "gradle-$Gradle版本-" } |
-                Select-Object -First 1
-            if (-not $Gradle可执行) {
-                # fallback：用任意可用版本
-                $Gradle可执行 = Get-ChildItem $Gradle发行目录 -Recurse -Filter "gradle.bat" -ErrorAction SilentlyContinue |
-                    Select-Object -First 1
-            }
-            if (-not $Gradle可执行) {
-                输出错误 "找不到可用的 Gradle，请安装 Gradle 或确保 ~/.gradle/wrapper/dists 中有已下载的版本"
-                exit 1
-            }
-            输出成功 "使用 Gradle: $($Gradle可执行.FullName)"
-            $工具目录 = Join-Path $平台根目录 "tools"
-            $原错误策略 = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-            & $Gradle可执行.FullName -p $工具目录 wrapper --gradle-version $Gradle版本 2>&1 | ForEach-Object { Write-Host "  $_" }
-            $ErrorActionPreference = $原错误策略
-            # 将 tools/ 下生成的 wrapper 文件复制到平台根目录
-            @("gradlew", "gradlew.bat") | ForEach-Object {
-                $源文件 = Join-Path $工具目录 $_
-                if (Test-Path $源文件) {
-                    Copy-Item $源文件 (Join-Path $平台根目录 $_) -Force
-                }
-            }
-            $源Gradle目录 = Join-Path $工具目录 "gradle"
-            if (Test-Path $源Gradle目录) {
-                Copy-Item $源Gradle目录 (Join-Path $平台根目录 "gradle") -Recurse -Force
-            }
-            if (Test-Path $Gradlew路径) {
-                输出成功 "Gradle wrapper 已生成"
-            } else {
-                输出错误 "Gradle wrapper 生成失败"
-                exit 1
-            }
-        }
     } finally {
         Pop-Location
     }
@@ -1020,155 +950,39 @@ function 确保DebugAxs可用 {
     编译AcodexServer
 }
 
-# ─── 同步资产到平台目录 ───────────────────────────────────────────────
-function 同步资产 {
-    输出步骤 "同步资产到 Android 平台目录"
-
+# ─── 注入 debug 构建改动 ─────────────────────────────────────────────
+function 注入Debug改动 {
     if (-not (Test-Path $平台Assets目录)) {
         输出错误 "平台 assets 目录不存在，请先运行: .\构建部署.ps1 -动作 setup"
         exit 1
     }
 
-    $Axs二进制 = Join-Path $Acodex根目录 "target/aarch64-unknown-linux-musl/release/axs"
     if ($构建模式 -eq "release") {
-        # Release builds: remove bundled axs to reduce APK size (app downloads latest)
-        $嵌入Axs = Join-Path $平台Assets目录 "axs"
-        if (Test-Path $嵌入Axs) { Remove-Item $嵌入Axs -Force }
-        输出成功 "release 模式：跳过 axs 嵌入（应用将从网络下载）"
-    } elseif (Test-Path $Axs二进制) {
-        Copy-Item $Axs二进制 (Join-Path $平台Assets目录 "axs") -Force
-        $大小MB = [math]::Round((Get-Item $Axs二进制).Length / 1MB, 1)
-        输出成功 "axs ($大小MB MB) → assets/axs（debug 嵌入）"
-    } else {
+        if ($启用调试客户端) {
+            输出错误 "release 构建禁止注入调试客户端。"
+            exit 1
+        }
+        输出成功 "release 构建不进行调试注入"
+        return
+    }
+
+    输出步骤 "注入 debug 构建改动"
+
+    $Axs二进制 = Join-Path $Acodex根目录 "target/aarch64-unknown-linux-musl/release/axs"
+    if (-not (Test-Path $Axs二进制)) {
         输出错误 "debug 模式要求嵌入 axs，但编译产物仍不存在: $Axs二进制"
         exit 1
     }
 
-    $Shell脚本列表 = @(
-        @{ 来源 = "src/plugins/terminal/scripts/init-alpine.sh";  目标文件名 = "init-alpine.sh" },
-        @{ 来源 = "src/plugins/terminal/scripts/init-sandbox.sh"; 目标文件名 = "init-sandbox.sh" },
-        @{ 来源 = "src/plugins/terminal/scripts/rm-wrapper.sh";   目标文件名 = "rm-wrapper.sh" }
-    )
-    foreach ($项 in $Shell脚本列表) {
-        $来源路径 = Join-Path $Acode根目录 $项.来源
-        if (Test-Path $来源路径) {
-            Copy-Item $来源路径 (Join-Path $平台Assets目录 $项.目标文件名) -Force
-            输出成功 "$($项.目标文件名) → assets/"
-        }
-    }
+    Copy-Item $Axs二进制 (Join-Path $平台Assets目录 "axs") -Force
+    $大小MB = [math]::Round((Get-Item $Axs二进制).Length / 1MB, 1)
+    输出成功 "axs ($大小MB MB) → assets/axs（debug 嵌入）"
 
-    $前端构建源  = Join-Path $Www目录 "build"
-    $前端构建目标 = Join-Path $平台AssetsWww "build"
-    if (Test-Path $前端构建源) {
-        if (-not (Test-Path $前端构建目标)) {
-            New-Item -ItemType Directory -Path $前端构建目标 -Force | Out-Null
-        }
-        Copy-Item -Path "$前端构建源\*" -Destination $前端构建目标 -Recurse -Force
-        $文件数 = (Get-ChildItem $前端构建源 -Recurse -File).Count
-        输出成功 "www/build → assets/www/build ($文件数 个文件)"
-    }
-
-    同步插件资产
-}
-
-function 同步插件资产 {
-    $Cordova插件Js = Join-Path $平台AssetsWww "cordova_plugins.js"
-    if (-not (Test-Path $Cordova插件Js)) {
-        输出警告 "cordova_plugins.js 不存在，跳过 JS 插件同步"
+    if (-not $启用调试客户端) {
+        输出成功 "未启用调试客户端注入，构建产物不依赖调试服务器"
         return
     }
 
-    $文件内容 = Get-Content $Cordova插件Js -Raw -Encoding UTF8
-    $模块ID映射 = @{}
-    $匹配结果 = [regex]::Matches($文件内容, '"id":\s*"([^"]+)"[^}]*?"file":\s*"([^"]+)"')
-    foreach ($匹配 in $匹配结果) {
-        $模块ID映射[$匹配.Groups[2].Value] = $匹配.Groups[1].Value
-    }
-
-    $插件目录到ID = @{
-        "terminal"                 = "com.foxdebug.acode.rk.exec.terminal"
-        "system"                   = "cordova-plugin-system"
-        "custom-tabs"              = "com.foxdebug.acode.rk.customtabs"
-        "pluginContext"            = "com.foxdebug.acode.rk.plugin.plugincontext"
-        "cordova-plugin-buildinfo" = "cordova-plugin-buildinfo"
-        "ftp"                      = "cordova-plugin-ftp"
-        "iap"                      = "cordova-plugin-iap"
-        "sdcard"                   = "cordova-plugin-sdcard"
-        "server"                   = "cordova-plugin-server"
-        "sftp"                     = "cordova-plugin-sftp"
-        "websocket"                = "cordova-plugin-websocket"
-    }
-
-    $JS文件数 = 0
-    foreach ($目录名 in $插件目录到ID.Keys) {
-        $插件ID      = $插件目录到ID[$目录名]
-        $插件Www目录 = Join-Path $Acode根目录 "src/plugins/$目录名/www"
-        if (-not (Test-Path $插件Www目录)) { continue }
-
-        Get-ChildItem $插件Www目录 -Filter "*.js" | ForEach-Object {
-            $JS文件       = $_
-            $平台相对路径 = "plugins/$插件ID/www/$($JS文件.Name)"
-            $目标路径     = Join-Path $平台AssetsWww $平台相对路径
-            $模块ID       = $模块ID映射[$平台相对路径]
-            if (-not $模块ID) { return }
-
-            $目标目录 = Split-Path $目标路径
-            if (-not (Test-Path $目标目录)) {
-                New-Item -ItemType Directory -Path $目标目录 -Force | Out-Null
-            }
-
-            $JS内容  = Get-Content $JS文件.FullName -Raw -Encoding UTF8
-            $包装内容 = "cordova.define(""$模块ID"", function(require, exports, module) {`n${JS内容}`n});`n"
-            Set-Content $目标路径 -Value $包装内容 -Encoding UTF8 -NoNewline
-            $JS文件数++
-        }
-    }
-    if ($JS文件数 -gt 0) {
-        输出成功 "JS 插件已同步 ($JS文件数 个，含 cordova.define 包装)"
-    }
-
-    验证Cordova平台插件同步
-}
-
-function 验证Cordova平台插件同步 {
-    $平台Java根目录 = Join-Path $平台根目录 "app/src/main/java"
-    $插件源码基目录 = Join-Path $Acode根目录 "src/plugins"
-    if (-not (Test-Path $平台Java根目录) -or -not (Test-Path $插件源码基目录)) {
-        return
-    }
-
-    $缺失文件列表 = [System.Collections.Generic.List[string]]::new()
-    Get-ChildItem $插件源码基目录 -Directory | ForEach-Object {
-        $Java文件列表 = Get-ChildItem $_.FullName -Filter "*.java" -Recurse -ErrorAction SilentlyContinue
-        foreach ($Java文件 in $Java文件列表) {
-            $前几行 = Get-Content $Java文件.FullName -TotalCount 10 -Encoding UTF8
-            $包名匹配 = $前几行 | Select-String -Pattern '^\s*package\s+([^;]+);' | Select-Object -First 1
-            if (-not $包名匹配) {
-                continue
-            }
-
-            $包路径 = $包名匹配.Matches[0].Groups[1].Value.Replace('.', '/')
-            $目标路径 = Join-Path (Join-Path $平台Java根目录 $包路径) $Java文件.Name
-            if (-not (Test-Path $目标路径)) {
-                $相对路径 = $Java文件.FullName.Substring($Acode根目录.Length + 1).Replace('\', '/')
-                $缺失文件列表.Add($相对路径)
-            }
-        }
-    }
-
-    if ($缺失文件列表.Count -gt 0) {
-        输出错误 "Cordova prepare 后仍有插件 Java 文件未进入平台源码，请检查对应 plugin.xml 的 <source-file> 声明："
-        foreach ($相对路径 in $缺失文件列表) {
-            输出错误 "  $相对路径"
-        }
-        exit 1
-    }
-
-    输出成功 "Cordova 平台 Java 同步校验通过"
-}
-
-# ─── 注入调试客户端 ───────────────────────────────────────────────────
-function 注入调试客户端 {
     $平台IndexHtml = Join-Path $平台AssetsWww "index.html"
     if (-not (Test-Path $平台IndexHtml)) {
         输出警告 "平台 index.html 不存在，跳过调试客户端注入"
@@ -1176,37 +990,20 @@ function 注入调试客户端 {
     }
 
     $内容 = Get-Content $平台IndexHtml -Raw -Encoding UTF8
-
-    # 先清理旧注入，避免上一次构建残留到当前产物。
     if ($内容 -match "HDC_DEBUG") {
         $内容 = $内容 -replace '(?s)\s*<!-- HDC_DEBUG -->.*?</script>\s*', "`n"
-        [System.IO.File]::WriteAllText($平台IndexHtml, $内容, [System.Text.UTF8Encoding]::new($false))
-        输出警告 "已清除旧版调试注入"
     }
 
-    if ($构建模式 -eq "release") {
-        输出成功 "release 构建默认不注入调试客户端"
-        return
-    }
-
-    if (-not $启用调试客户端) {
-        输出成功 "未启用调试客户端注入，构建产物不依赖调试服务器"
-        return
-    }
-
-    # 检测局域网IP（优先 WLAN/以太网等实际物理网卡，排除虚拟网卡和移动热点）
     $候选 = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
         $_.PrefixOrigin -ne "WellKnown" -and
         $_.IPAddress -notmatch '^169\.254\.' -and
         $_.IPAddress -ne '127.0.0.1' -and
         $_.InterfaceAlias -notmatch 'Loopback|vEthernet|Hyper-V|WSL|VirtualBox|VMware|isatap|Teredo|Bluetooth|本地连接\*'
     }
-    # 优先选择 WLAN / Wi-Fi / 以太网等实际物理网卡（DHCP 分配的地址更可靠）
     $内网IP = ($候选 | Where-Object {
         $_.InterfaceAlias -match 'WLAN|Wi-Fi|以太网|Ethernet' -and $_.PrefixOrigin -eq 'Dhcp'
     } | Select-Object -First 1).IPAddress
     if (-not $内网IP) {
-        # fallback：任意 DHCP 分配的私有 IP
         $内网IP = ($候选 | Where-Object {
             $_.PrefixOrigin -eq 'Dhcp' -and (
                 $_.IPAddress -match '^192\.168\.' -or $_.IPAddress -match '^10\.' -or
@@ -1217,18 +1014,17 @@ function 注入调试客户端 {
     if (-not $内网IP) {
         $内网IP = ($候选 | Select-Object -First 1).IPAddress
     }
-    if (-not $内网IP) { $内网IP = "127.0.0.1" }
+    if (-not $内网IP) {
+        $内网IP = "127.0.0.1"
+    }
 
     $调试端口 = 8092
     $调试脚本标签 = "    <!-- HDC_DEBUG --><script src=`"http://${内网IP}:${调试端口}/__debug_client.js`"></script>"
-
-    # 在 cordova.js 之前插入
     $内容 = $内容 -replace '(\s*<script src="cordova\.js"></script>)', "`n$调试脚本标签`n`$1"
     [System.IO.File]::WriteAllText($平台IndexHtml, $内容, [System.Text.UTF8Encoding]::new($false))
 
-    输出步骤 "注入调试客户端"
     输出成功 "调试服务器地址: http://${内网IP}:${调试端口}"
-    输出成功 "已注入到平台 index.html（仅影响构建产物，不修改源文件）"
+    输出成功 "已注入调试客户端到平台 index.html"
 }
 
 # ─── 构建前端资源 ─────────────────────────────────────────────────────
@@ -1267,11 +1063,16 @@ function 构建APK {
 
     $Gradle任务 = if ($构建模式 -eq "release") { "assembleRelease" } else { "assembleDebug" }
     $输出目录   = if ($构建模式 -eq "release") { $发布APK输出目录 } else { $调试APK输出目录 }
+    $Gradle参数 = @($Gradle任务)
+    if ($script:BuildTools最新版) {
+        $Gradle参数 += "-PcdvBuildToolsVersion=$($script:BuildTools最新版)"
+        输出成功 "使用运行时 Build Tools 版本: $($script:BuildTools最新版)"
+    }
 
     Push-Location (Split-Path $Gradlew路径)
     try {
         # 直接运行，不经过 pipeline——避免 Gradle Daemon 持有管道句柄导致卡死
-        & $Gradlew路径 $Gradle任务
+        & $Gradlew路径 @Gradle参数
         if ($LASTEXITCODE -ne 0) {
             输出错误 "Gradle 构建失败 (exit code: $LASTEXITCODE)"
             exit 1
@@ -1474,8 +1275,7 @@ switch ($动作) {
         设置Cordova平台
         确保DebugAxs可用
         构建前端
-        同步资产
-        注入调试客户端
+        注入Debug改动
         构建APK
         验证源码未被修改
     }
@@ -1499,8 +1299,7 @@ switch ($动作) {
             编译AcodexServer
         }
         构建前端
-        同步资产
-        注入调试客户端
+        注入Debug改动
         $APK文件 = 构建APK
         验证源码未被修改
         部署APK -APK路径 $APK文件
