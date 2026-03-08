@@ -1053,29 +1053,44 @@ function 同步插件资产 {
         输出成功 "JS 插件已同步 ($JS文件数 个，含 cordova.define 包装)"
     }
 
-    $平台Java根目录  = Join-Path $平台根目录 "app/src/main/java"
-    $Java文件数      = 0
-    $插件源码基目录  = Join-Path $Acode根目录 "src/plugins"
-    if (Test-Path $插件源码基目录) {
-        Get-ChildItem $插件源码基目录 -Directory | ForEach-Object {
-            $Java文件列表 = Get-ChildItem $_.FullName -Filter "*.java" -Recurse -ErrorAction SilentlyContinue
-            foreach ($Java文件 in $Java文件列表) {
-                $前几行   = Get-Content $Java文件.FullName -TotalCount 10 -Encoding UTF8
-                $包名匹配 = $前几行 | Select-String -Pattern '^\s*package\s+([^;]+);' | Select-Object -First 1
-                if ($包名匹配) {
-                    $包路径   = $包名匹配.Matches[0].Groups[1].Value.Replace('.', '/')
-                    $目标目录 = Join-Path $平台Java根目录 $包路径
-                    if (Test-Path $目标目录) {
-                        Copy-Item $Java文件.FullName (Join-Path $目标目录 $Java文件.Name) -Force
-                        $Java文件数++
-                    }
-                }
+    验证Cordova平台插件同步
+}
+
+function 验证Cordova平台插件同步 {
+    $平台Java根目录 = Join-Path $平台根目录 "app/src/main/java"
+    $插件源码基目录 = Join-Path $Acode根目录 "src/plugins"
+    if (-not (Test-Path $平台Java根目录) -or -not (Test-Path $插件源码基目录)) {
+        return
+    }
+
+    $缺失文件列表 = [System.Collections.Generic.List[string]]::new()
+    Get-ChildItem $插件源码基目录 -Directory | ForEach-Object {
+        $Java文件列表 = Get-ChildItem $_.FullName -Filter "*.java" -Recurse -ErrorAction SilentlyContinue
+        foreach ($Java文件 in $Java文件列表) {
+            $前几行 = Get-Content $Java文件.FullName -TotalCount 10 -Encoding UTF8
+            $包名匹配 = $前几行 | Select-String -Pattern '^\s*package\s+([^;]+);' | Select-Object -First 1
+            if (-not $包名匹配) {
+                continue
+            }
+
+            $包路径 = $包名匹配.Matches[0].Groups[1].Value.Replace('.', '/')
+            $目标路径 = Join-Path (Join-Path $平台Java根目录 $包路径) $Java文件.Name
+            if (-not (Test-Path $目标路径)) {
+                $相对路径 = $Java文件.FullName.Substring($Acode根目录.Length + 1).Replace('\', '/')
+                $缺失文件列表.Add($相对路径)
             }
         }
     }
-    if ($Java文件数 -gt 0) {
-        输出成功 "Java 源文件已同步 ($Java文件数 个)"
+
+    if ($缺失文件列表.Count -gt 0) {
+        输出错误 "Cordova prepare 后仍有插件 Java 文件未进入平台源码，请检查对应 plugin.xml 的 <source-file> 声明："
+        foreach ($相对路径 in $缺失文件列表) {
+            输出错误 "  $相对路径"
+        }
+        exit 1
     }
+
+    输出成功 "Cordova 平台 Java 同步校验通过"
 }
 
 # ─── 注入调试客户端 ───────────────────────────────────────────────────
@@ -1381,6 +1396,7 @@ switch ($动作) {
 
     "build-apk" {
         初始化构建环境
+        设置Cordova平台
         构建前端
         同步资产
         注入调试客户端
