@@ -63,6 +63,8 @@ param(
 
     [switch]$启用调试客户端,
 
+    [switch]$强制重建平台,
+
     [int]$NDK接口级别 = 28
 )
 
@@ -927,6 +929,167 @@ function 获取已安装Gradle目录([string]$Gradle版本) {
     return $候选目录 | Select-Object -First 1
 }
 
+function 提取版本号([string]$版本文本) {
+    if ([string]::IsNullOrWhiteSpace($版本文本)) {
+        return $null
+    }
+
+    $匹配结果 = [regex]::Match($版本文本, '\d+\.\d+\.\d+')
+    if (-not $匹配结果.Success) {
+        return $null
+    }
+
+    return $匹配结果.Value
+}
+
+function 获取已安装CordovaAndroid版本 {
+    $版本脚本路径 = Join-Path $平台根目录 "cordova/version"
+    if (-not (Test-Path $版本脚本路径)) {
+        return $null
+    }
+
+    Push-Location $Acode根目录
+    try {
+        $版本输出 = & node $版本脚本路径 2>$null | Select-Object -Last 1
+        if ($LASTEXITCODE -ne 0) {
+            return $null
+        }
+
+        return (提取版本号 ([string]$版本输出))
+    } finally {
+        Pop-Location
+    }
+}
+
+function 获取本地Cordova插件列表 {
+    $PackageJson路径 = Join-Path $Acode根目录 "package.json"
+    if (-not (Test-Path $PackageJson路径)) {
+        return @()
+    }
+
+    try {
+        $PackageJson = Get-Content $PackageJson路径 -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        输出错误 "无法解析 package.json，无法刷新本地 Cordova 插件"
+        exit 1
+    }
+
+    $Cordova插件配置 = $PackageJson.cordova.plugins
+    $开发依赖 = $PackageJson.devDependencies
+    if (-not $Cordova插件配置 -or -not $开发依赖) {
+        return @()
+    }
+
+    $插件列表 = [System.Collections.Generic.List[hashtable]]::new()
+    foreach ($属性 in $开发依赖.PSObject.Properties) {
+        $插件ID = $属性.Name
+        $依赖值 = [string]$属性.Value
+        if (-not $依赖值.StartsWith("file:")) {
+            continue
+        }
+
+        if (-not ($Cordova插件配置.PSObject.Properties.Name -contains $插件ID)) {
+            continue
+        }
+
+        $相对路径 = $依赖值.Substring(5).Replace('/', '\\')
+        $绝对路径 = Join-Path $Acode根目录 $相对路径
+        $插件列表.Add(@{
+            ID = $插件ID
+            路径 = $绝对路径
+            相对路径 = $相对路径
+        })
+    }
+
+    return @($插件列表)
+}
+
+function 获取目录文件签名([string]$目录路径) {
+    if (-not (Test-Path $目录路径)) {
+        return $null
+    }
+
+    $绝对目录路径 = (Resolve-Path $目录路径).Path
+    $签名列表 = [System.Collections.Generic.List[string]]::new()
+    $文件列表 = Get-ChildItem $绝对目录路径 -File -Recurse -ErrorAction Stop |
+        Sort-Object FullName
+
+    foreach ($文件 in $文件列表) {
+        $相对路径 = $文件.FullName.Substring($绝对目录路径.Length).TrimStart('\\').Replace('\\', '/')
+        $文件哈希 = (Get-FileHash $文件.FullName -Algorithm SHA256).Hash
+        $签名列表.Add("$相对路径|$文件哈希")
+    }
+
+    return @($签名列表)
+}
+
+function 测试本地Cordova插件需要刷新($插件) {
+    $源码插件目录 = $插件.路径
+    $已安装插件目录 = Join-Path (Join-Path $Acode根目录 "plugins") $插件.ID
+
+    if (-not (Test-Path $已安装插件目录)) {
+        return $true
+    }
+
+    $源码签名 = 获取目录文件签名 $源码插件目录
+    $已安装签名 = 获取目录文件签名 $已安装插件目录
+    if ($null -eq $源码签名 -or $null -eq $已安装签名) {
+        return $true
+    }
+
+    if ($源码签名.Count -ne $已安装签名.Count) {
+        return $true
+    }
+
+    return [bool](Compare-Object -ReferenceObject $源码签名 -DifferenceObject $已安装签名)
+}
+
+function 刷新本地Cordova插件 {
+    $本地插件列表 = @(获取本地Cordova插件列表)
+    if ($本地插件列表.Count -eq 0) {
+        输出成功 "未检测到需要刷新的本地 Cordova 插件"
+        return 0
+    }
+
+    输出步骤 "检查本地 Cordova 插件是否需要刷新"
+    $已刷新插件数 = 0
+    foreach ($插件 in $本地插件列表) {
+        $插件配置文件 = Join-Path $插件.路径 "plugin.xml"
+        if (-not (Test-Path $插件配置文件)) {
+            输出错误 "本地插件缺少 plugin.xml: $($插件.相对路径)"
+            exit 1
+        }
+
+        if (-not (测试本地Cordova插件需要刷新 $插件)) {
+            Write-Host "  跳过插件: $($插件.ID)（源码与已安装副本一致）" -ForegroundColor DarkGray
+            continue
+        }
+
+        Write-Host "  刷新插件: $($插件.ID) <- $($插件.相对路径)" -ForegroundColor DarkGray
+
+        npx cordova plugin remove $($插件.ID) --nosave 2>&1 | ForEach-Object { Write-Host "  $_" }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "  忽略 remove 失败（可能尚未安装）: $($插件.ID)" -ForegroundColor DarkGray
+        }
+
+        npx cordova plugin add $($插件.路径) --nosave 2>&1 | ForEach-Object { Write-Host "  $_" }
+        if ($LASTEXITCODE -ne 0) {
+            输出错误 "cordova plugin add 失败: $($插件.ID)"
+            exit 1
+        }
+
+        $已刷新插件数++
+    }
+
+    if ($已刷新插件数 -eq 0) {
+        输出成功 "本地 Cordova 插件均与 src/plugins 源码一致，已跳过刷新"
+        return 0
+    }
+
+    输出成功 "已刷新 $已刷新插件数 个本地 Cordova 插件"
+    return $已刷新插件数
+}
+
 function 转换为FileUrl([string]$文件路径) {
     return [System.Uri]::new((Resolve-Path $文件路径)).AbsoluteUri
 }
@@ -938,6 +1101,30 @@ function 重建CordovaAndroid平台 {
         "android"
     } else {
         "android@$CordovaAndroid版本约束"
+    }
+
+    $期望平台版本 = 提取版本号 $CordovaAndroid版本约束
+    $已安装平台版本 = if ($已存在平台) { 获取已安装CordovaAndroid版本 } else { $null }
+    $已刷新插件数 = 刷新本地Cordova插件
+    $需要重建平台 = $强制重建平台 -or -not $已存在平台
+
+    if ($已存在平台 -and -not $已安装平台版本) {
+        输出警告 "无法识别当前 Android 平台版本，改为重建平台"
+        $需要重建平台 = $true
+    }
+
+    if ($已存在平台 -and $期望平台版本 -and $已安装平台版本 -and $期望平台版本 -ne $已安装平台版本) {
+        输出警告 "cordova-android 版本已变化（当前 $已安装平台版本，期望 $期望平台版本），改为重建平台"
+        $需要重建平台 = $true
+    }
+
+    if (-not $需要重建平台) {
+        if ($已刷新插件数 -gt 0) {
+            输出成功 "已复用现有 Android 平台，并将变更插件同步到平台"
+        } else {
+            输出成功 "已复用现有 Android 平台，无需重新 add platform"
+        }
+        return
     }
 
     if ($已存在平台) {
@@ -1032,56 +1219,57 @@ function 确保DebugAxs可用 {
     编译AcodexServer
 }
 
-# ─── 注入 debug 构建改动 ─────────────────────────────────────────────
-function 注入Debug改动 {
-    if (-not (Test-Path $平台Assets目录)) {
-        输出错误 "平台 assets 目录不存在，请先运行: .\构建部署.ps1 -动作 setup"
-        exit 1
-    }
-
-    if ($构建模式 -eq "release") {
-        if ($启用调试客户端) {
-            输出错误 "release 构建禁止注入调试客户端。"
-            exit 1
-        }
-        输出成功 "release 构建不进行调试注入"
-        return
-    }
-
-    输出步骤 "注入 debug 构建改动"
-
-    $Axs二进制 = Join-Path $Acodex根目录 "target/aarch64-unknown-linux-musl/release/axs"
-    if (-not (Test-Path $Axs二进制)) {
-        输出错误 "debug 模式要求嵌入 axs，但编译产物仍不存在: $Axs二进制"
-        exit 1
-    }
-
-    Copy-Item $Axs二进制 (Join-Path $平台Assets目录 "axs") -Force
-    $大小MB = [math]::Round((Get-Item $Axs二进制).Length / 1MB, 1)
-    输出成功 "axs ($大小MB MB) → assets/axs（debug 嵌入）"
-
-    if (-not $启用调试客户端) {
-        输出成功 "未启用调试客户端注入，构建产物不依赖调试服务器"
-        return
-    }
-
+function 清理平台调试客户端注入 {
     $平台IndexHtml = Join-Path $平台AssetsWww "index.html"
     if (-not (Test-Path $平台IndexHtml)) {
-        输出警告 "平台 index.html 不存在，跳过调试客户端注入"
-        return
+        return $false
     }
 
     $内容 = Get-Content $平台IndexHtml -Raw -Encoding UTF8
-    if ($内容 -match "HDC_DEBUG") {
-        $内容 = $内容 -replace '(?s)\s*<!-- HDC_DEBUG -->.*?</script>\s*', "`n"
+    if ($内容 -notmatch "HDC_DEBUG") {
+        return $false
     }
 
+    $内容 = $内容 -replace '(?s)\s*<!-- HDC_DEBUG -->.*?</script>\s*', "`n"
+    [System.IO.File]::WriteAllText($平台IndexHtml, $内容, [System.Text.UTF8Encoding]::new($false))
+    return $true
+}
+
+function 设置平台调试Scheme {
+    param(
+        [string]$Scheme值
+    )
+
+    $平台ConfigXml = Join-Path $平台根目录 "app/src/main/res/xml/config.xml"
+    if (-not (Test-Path $平台ConfigXml)) {
+        输出警告 "平台 config.xml 不存在，跳过 Scheme 注入"
+        return $false
+    }
+
+    $配置内容 = Get-Content $平台ConfigXml -Raw -Encoding UTF8
+    $原配置内容 = $配置内容
+    $配置内容 = $配置内容 -replace '(?m)^\s*<preference name="Scheme" value="[^"]*"\s*/>\s*\r?\n?', ''
+
+    if (-not [string]::IsNullOrWhiteSpace($Scheme值)) {
+        $配置内容 = $配置内容 -replace '</widget>', "    <preference name=`"Scheme`" value=`"$Scheme值`" />`n</widget>"
+    }
+
+    if ($配置内容 -eq $原配置内容) {
+        return $false
+    }
+
+    [System.IO.File]::WriteAllText($平台ConfigXml, $配置内容, [System.Text.UTF8Encoding]::new($false))
+    return $true
+}
+
+function 获取调试服务器内网IP {
     $候选 = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
         $_.PrefixOrigin -ne "WellKnown" -and
         $_.IPAddress -notmatch '^169\.254\.' -and
         $_.IPAddress -ne '127.0.0.1' -and
         $_.InterfaceAlias -notmatch 'Loopback|vEthernet|Hyper-V|WSL|VirtualBox|VMware|isatap|Teredo|Bluetooth|本地连接\*'
     }
+
     $内网IP = ($候选 | Where-Object {
         $_.InterfaceAlias -match 'WLAN|Wi-Fi|以太网|Ethernet' -and $_.PrefixOrigin -eq 'Dhcp'
     } | Select-Object -First 1).IPAddress
@@ -1100,7 +1288,96 @@ function 注入Debug改动 {
         $内网IP = "127.0.0.1"
     }
 
+    return $内网IP
+}
+
+function 测试调试服务器可达 {
+    param(
+        [string]$主机,
+        [int]$端口
+    )
+
+    try {
+        $客户端 = New-Object System.Net.Sockets.TcpClient
+        $异步结果 = $客户端.BeginConnect($主机, $端口, $null, $null)
+        if (-not $异步结果.AsyncWaitHandle.WaitOne(1500, $false)) {
+            $客户端.Close()
+            return $false
+        }
+
+        $客户端.EndConnect($异步结果)
+        $客户端.Close()
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+# ─── 注入 debug 构建改动 ─────────────────────────────────────────────
+function 注入Debug改动 {
+    if (-not (Test-Path $平台Assets目录)) {
+        输出错误 "平台 assets 目录不存在，请先运行: .\构建部署.ps1 -动作 setup"
+        exit 1
+    }
+
+    if ($构建模式 -eq "release") {
+        if ($启用调试客户端) {
+            输出错误 "release 构建禁止注入调试客户端。"
+            exit 1
+        }
+        if (设置平台调试Scheme -Scheme值 $null) {
+            输出成功 "已清理平台产物中的调试 Scheme 注入"
+        }
+        if (清理平台调试客户端注入) {
+            输出成功 "已清理平台产物中的旧调试注入"
+        }
+        输出成功 "release 构建不进行调试注入"
+        return
+    }
+
+    输出步骤 "注入 debug 构建改动"
+
+    $Axs二进制 = Join-Path $Acodex根目录 "target/aarch64-unknown-linux-musl/release/axs"
+    if (-not (Test-Path $Axs二进制)) {
+        输出错误 "debug 模式要求嵌入 axs，但编译产物仍不存在: $Axs二进制"
+        exit 1
+    }
+
+    Copy-Item $Axs二进制 (Join-Path $平台Assets目录 "axs") -Force
+    $大小MB = [math]::Round((Get-Item $Axs二进制).Length / 1MB, 1)
+    输出成功 "axs ($大小MB MB) → assets/axs（debug 嵌入）"
+
+    $已清理旧注入 = 清理平台调试客户端注入
+    if (-not $启用调试客户端) {
+        if (设置平台调试Scheme -Scheme值 $null) {
+            输出成功 "已清理平台产物中的调试 Scheme 注入"
+        }
+        if ($已清理旧注入) {
+            输出成功 "已清理平台产物中的旧调试注入"
+        }
+        输出成功 "未启用调试客户端注入，构建产物不依赖调试服务器"
+        return
+    }
+
+    $平台IndexHtml = Join-Path $平台AssetsWww "index.html"
+    if (-not (Test-Path $平台IndexHtml)) {
+        输出警告 "平台 index.html 不存在，跳过调试客户端注入"
+        return
+    }
+
+    $内网IP = 获取调试服务器内网IP
     $调试端口 = 8092
+    if (-not (测试调试服务器可达 -主机 $内网IP -端口 $调试端口)) {
+        输出错误 "已显式请求局域网日志注入，但调试服务器不可达: ${内网IP}:$调试端口"
+        输出错误 "请先启动 scripts/调试服务器.ps1，再重新构建。"
+        exit 1
+    }
+
+    if (设置平台调试Scheme -Scheme值 "http") {
+        输出成功 "已将平台 Cordova Scheme 设置为 http（允许调试脚本与 ws:// 连接）"
+    }
+
+    $内容 = Get-Content $平台IndexHtml -Raw -Encoding UTF8
     $调试脚本标签 = "    <!-- HDC_DEBUG --><script src=`"http://${内网IP}:${调试端口}/__debug_client.js`"></script>"
     $内容 = $内容 -replace '(\s*<script src="cordova\.js"></script>)', "`n$调试脚本标签`n`$1"
     [System.IO.File]::WriteAllText($平台IndexHtml, $内容, [System.Text.UTF8Encoding]::new($false))
@@ -1141,7 +1418,7 @@ function 使用本机Gradle构建APK {
     }
 
     $Gradle任务 = if ($构建模式 -eq "release") { "cdvBuildRelease" } else { "cdvBuildDebug" }
-    $Gradle参数 = @("-p", $平台根目录)
+    $Gradle参数 = @("--build-cache", "--parallel", "-p", $平台根目录)
     if ($script:BuildTools最新版) {
         $Gradle参数 += "-PcdvBuildToolsVersion=$($script:BuildTools最新版)"
     }
@@ -1360,6 +1637,7 @@ switch ($动作) {
 
     "build-apk" {
         初始化构建环境
+        安装Node依赖
         开始源码保护
         设置Cordova平台
         确保DebugAxs可用

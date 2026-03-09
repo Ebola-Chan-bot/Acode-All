@@ -390,7 +390,7 @@ function 处理新连接([System.Net.Sockets.TcpClient]$tcp客户端) {
         if (WS握手 $头部 $流) {
             $来源 = $tcp客户端.Client.RemoteEndPoint.ToString()
             Write-Host "[连接] $来源" -ForegroundColor Green
-            $流.ReadTimeout = 200
+            $流.ReadTimeout = 5000
             $script:WS客户端列表.Add(@{ 流 = $流; TCP = $tcp客户端; 来源 = $来源 })
         } else { $tcp客户端.Close() }
         return
@@ -505,7 +505,14 @@ try {
                     }
                     if ($帧.类型 -eq "文本" -and $帧.数据.Length -gt 0) { 处理消息 $帧.数据 }
                 }
-            } catch { $死链.Add($i) }
+            } catch [System.IO.IOException] {
+                if ($_.Exception.InnerException -is [System.Net.Sockets.SocketException] -and $_.Exception.InnerException.SocketErrorCode -eq [System.Net.Sockets.SocketError]::TimedOut) {
+                    continue
+                }
+                $死链.Add($i)
+            } catch {
+                $死链.Add($i)
+            }
         }
         for ($j = $死链.Count - 1; $j -ge 0; $j--) {
             $ws = $script:WS客户端列表[$死链[$j]]
