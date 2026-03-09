@@ -1069,7 +1069,8 @@ function 刷新本地Cordova插件 {
 
         npx cordova plugin remove $($插件.ID) --nosave 2>&1 | ForEach-Object { Write-Host "  $_" }
         if ($LASTEXITCODE -ne 0) {
-            Write-Host "  忽略 remove 失败（可能尚未安装）: $($插件.ID)" -ForegroundColor DarkGray
+            输出错误 "cordova plugin remove 失败: $($插件.ID)"
+            exit 1
         }
 
         npx cordova plugin add $($插件.路径) --nosave 2>&1 | ForEach-Object { Write-Host "  $_" }
@@ -1221,9 +1222,6 @@ function 确保DebugAxs可用 {
 
 function 清理平台调试客户端注入 {
     $平台IndexHtml = Join-Path $平台AssetsWww "index.html"
-    if (-not (Test-Path $平台IndexHtml)) {
-        return $false
-    }
 
     $内容 = Get-Content $平台IndexHtml -Raw -Encoding UTF8
     if ($内容 -notmatch "HDC_DEBUG") {
@@ -1235,16 +1233,35 @@ function 清理平台调试客户端注入 {
     return $true
 }
 
+function 设置平台终端Axs启动参数 {
+    param(
+        [bool]$启用AllowAnyOrigin
+    )
+
+    $平台终端启动脚本 = Join-Path $平台AssetsWww "plugins/com.foxdebug.acode.rk.exec.terminal/scripts/init-alpine.sh"
+
+    $内容 = Get-Content $平台终端启动脚本 -Raw -Encoding UTF8
+    $原内容 = $内容
+    $内容 = $内容 -replace '"\$PREFIX/axs"\s+--allow-any-origin\s+-c\s+"bash --rcfile /initrc -i"', '"$PREFIX/axs" -c "bash --rcfile /initrc -i"'
+
+    if ($启用AllowAnyOrigin) {
+        $内容 = $内容 -replace '"\$PREFIX/axs" -c "bash --rcfile /initrc -i"', '"$PREFIX/axs" --allow-any-origin -c "bash --rcfile /initrc -i"'
+    }
+
+    if ($内容 -eq $原内容) {
+        return $false
+    }
+
+    [System.IO.File]::WriteAllText($平台终端启动脚本, $内容, [System.Text.UTF8Encoding]::new($false))
+    return $true
+}
+
 function 设置平台调试Scheme {
     param(
         [string]$Scheme值
     )
 
     $平台ConfigXml = Join-Path $平台根目录 "app/src/main/res/xml/config.xml"
-    if (-not (Test-Path $平台ConfigXml)) {
-        输出警告 "平台 config.xml 不存在，跳过 Scheme 注入"
-        return $false
-    }
 
     $配置内容 = Get-Content $平台ConfigXml -Raw -Encoding UTF8
     $原配置内容 = $配置内容
@@ -1328,6 +1345,9 @@ function 注入Debug改动 {
         if (设置平台调试Scheme -Scheme值 $null) {
             输出成功 "已清理平台产物中的调试 Scheme 注入"
         }
+        if (设置平台终端Axs启动参数 -启用AllowAnyOrigin $false) {
+            输出成功 "已清理平台终端 AXS 的调试启动参数注入"
+        }
         if (清理平台调试客户端注入) {
             输出成功 "已清理平台产物中的旧调试注入"
         }
@@ -1352,6 +1372,9 @@ function 注入Debug改动 {
         if (设置平台调试Scheme -Scheme值 $null) {
             输出成功 "已清理平台产物中的调试 Scheme 注入"
         }
+        if (设置平台终端Axs启动参数 -启用AllowAnyOrigin $false) {
+            输出成功 "已清理平台终端 AXS 的调试启动参数注入"
+        }
         if ($已清理旧注入) {
             输出成功 "已清理平台产物中的旧调试注入"
         }
@@ -1360,10 +1383,6 @@ function 注入Debug改动 {
     }
 
     $平台IndexHtml = Join-Path $平台AssetsWww "index.html"
-    if (-not (Test-Path $平台IndexHtml)) {
-        输出警告 "平台 index.html 不存在，跳过调试客户端注入"
-        return
-    }
 
     $内网IP = 获取调试服务器内网IP
     $调试端口 = 8092
@@ -1375,6 +1394,9 @@ function 注入Debug改动 {
 
     if (设置平台调试Scheme -Scheme值 "http") {
         输出成功 "已将平台 Cordova Scheme 设置为 http（允许调试脚本与 ws:// 连接）"
+    }
+    if (设置平台终端Axs启动参数 -启用AllowAnyOrigin $true) {
+        输出成功 "已为平台终端 AXS 注入 allow-any-origin 启动参数"
     }
 
     $内容 = Get-Content $平台IndexHtml -Raw -Encoding UTF8
@@ -1474,41 +1496,41 @@ function 构建APK {
 function 检测设备连接 {
     if ($设备模式 -eq "adb") {
         $有ADB = Get-Command "adb" -ErrorAction SilentlyContinue
-        $ADB设备已连接 = $false
         if ($有ADB) {
             $已连接设备 = adb devices 2>&1 | Select-String "device$"
             if ($已连接设备) {
                 输出成功 "ADB 设备: $($已连接设备.Line.Trim())"
-                $ADB设备已连接 = $true
+                return
             }
         }
-        if (-not $ADB设备已连接) {
-            # ADB 不可用或无设备，自动尝试 HDC
-            $HDC可用 = $false
-            if (Test-Path $HDC程序路径) {
-                $HDC可用 = $true
-            } else {
-                $已找到HDC = Get-Command hdc -ErrorAction SilentlyContinue
-                if ($已找到HDC) {
-                    $script:HDC程序路径 = $已找到HDC.Source
-                    $HDC可用 = $true
-                }
+
+        # ADB 与 HDC 都是脚本正式支持的设备连接方式。
+        # 当调用方选择 adb 模式时，这里优先尝试 adb；若当前环境下 adb 不可用
+        # 或未发现设备，则继续尝试 hdc。这是同级的正常功能路径，不属于兜底。
+        if (-not (Test-Path $HDC程序路径)) {
+            $已找到HDC = Get-Command hdc -ErrorAction SilentlyContinue
+            if ($已找到HDC) {
+                $script:HDC程序路径 = $已找到HDC.Source
             }
-            if ($HDC可用) {
-                $设备列表 = & $HDC程序路径 list targets 2>&1
-                if ($设备列表 -notmatch "^\[Empty\]$" -and -not [string]::IsNullOrWhiteSpace($设备列表)) {
-                    输出警告 "ADB 未检测到设备，自动切换到 HDC"
-                    $script:设备模式 = "hdc"
-                    输出成功 "HDC 设备: $($设备列表.Trim())"
-                    return
-                }
-            }
-            输出错误 "未检测到任何设备（ADB 和 HDC 均无响应），请确认："
-            输出错误 "  1. 手机已通过 USB 连接到电脑"
-            输出错误 "  2. 手机已开启 USB 调试 / 开发者模式"
-            输出错误 "  3. 手机上已授权此电脑的调试"
-            exit 1
         }
+
+        if (Test-Path $HDC程序路径) {
+            $设备列表 = & $HDC程序路径 list targets 2>&1
+            if ($设备列表 -notmatch "^\[Empty\]$" -and -not [string]::IsNullOrWhiteSpace($设备列表)) {
+                $script:设备模式 = "hdc"
+                输出成功 "HDC 设备: $($设备列表.Trim())"
+                return
+            }
+        }
+
+        输出错误 "未检测到任何设备（ADB 和 HDC 均无响应），请确认："
+        输出错误 "  1. 手机已通过 USB 连接到电脑"
+        输出错误 "  2. 手机已开启 USB 调试 / 开发者模式"
+        输出错误 "  3. 手机上已授权此电脑的调试"
+        if (-not $有ADB) {
+            输出错误 "  4. 当前未找到 adb，且 hdc 也不可用"
+        }
+        exit 1
     } else {
         if (-not (Test-Path $HDC程序路径)) {
             $已找到HDC = Get-Command hdc -ErrorAction SilentlyContinue
@@ -1576,14 +1598,8 @@ function 部署APK {
         if ($LASTEXITCODE -eq 0) {
             输出成功 "推送成功！请在手机文件管理器 → 下载 中点击安装"
         } else {
-            输出警告 "推送可能失败，尝试备选路径..."
-            $备选路径 = "/data/local/tmp/$($APK文件项.Name)"
-            & $HDC程序路径 file send $APK文件项.FullName $备选路径 2>&1 | ForEach-Object { Write-Host "  $_" }
-            if ($LASTEXITCODE -eq 0) {
-                输出成功 "已推送到 $备选路径，可能需要手动安装"
-            } else {
-                输出错误 "推送失败，请检查 HDC 连接和设备权限"
-            }
+            输出错误 "推送失败，请检查 HDC 连接和设备权限"
+            exit 1
         }
     }
 }
@@ -1600,12 +1616,8 @@ function 清理构建产物 {
     )
 
     foreach ($目标 in $清理目标列表) {
-        if (Test-Path $目标.路径) {
-            Remove-Item $目标.路径 -Recurse -Force
-            输出成功 "已清理: $($目标.描述)"
-        } else {
-            Write-Host "  跳过: $($目标.描述)（不存在）" -ForegroundColor DarkGray
-        }
+        Remove-Item $目标.路径 -Recurse -Force
+        输出成功 "已清理: $($目标.描述)"
     }
 }
 
