@@ -1238,7 +1238,12 @@ function 设置平台终端Axs启动参数 {
         [bool]$启用AllowAnyOrigin
     )
 
-    $平台终端启动脚本 = Join-Path $平台AssetsWww "plugins/com.foxdebug.acode.rk.exec.terminal/scripts/init-alpine.sh"
+    $平台终端启动脚本 = Join-Path $平台Assets目录 "init-alpine.sh"
+
+    if (-not (Test-Path $平台终端启动脚本)) {
+        输出错误 "找不到平台终端启动脚本: $平台终端启动脚本"
+        exit 1
+    }
 
     $内容 = Get-Content $平台终端启动脚本 -Raw -Encoding UTF8
     $原内容 = $内容
@@ -1330,6 +1335,95 @@ function 测试调试服务器可达 {
     }
 }
 
+function 获取调试服务器TLS元数据 {
+    $元数据路径 = Join-Path $PSScriptRoot "logs/调试服务器-metadata.json"
+    if (-not (Test-Path $元数据路径)) {
+        return $null
+    }
+
+    try {
+        $元数据 = Get-Content $元数据路径 -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        输出错误 "调试服务器元数据解析失败: $元数据路径"
+        exit 1
+    }
+
+    if ([string]::IsNullOrWhiteSpace($元数据.host) -or -not $元数据.port) {
+        输出错误 "调试服务器元数据缺少 host/port: $元数据路径"
+        exit 1
+    }
+    if ([string]::IsNullOrWhiteSpace($元数据.certificatePath) -or -not (Test-Path $元数据.certificatePath)) {
+        输出错误 "调试服务器证书不存在: $($元数据.certificatePath)"
+        exit 1
+    }
+    if ($元数据.scheme -ne "https" -or $元数据.wsScheme -ne "wss") {
+        输出错误 "调试服务器未启用 HTTPS/WSS，请先重新启动 scripts/调试服务器.ps1"
+        exit 1
+    }
+    if ($元数据.host -eq "127.0.0.1") {
+        输出错误 "调试服务器当前仅监听本机地址，手机无法通过局域网访问。"
+        exit 1
+    }
+
+    return $元数据
+}
+
+function 清理平台调试证书信任 {
+    $调试资源根目录 = Join-Path $平台根目录 "app/src/debug/res"
+    $调试证书路径 = Join-Path $调试资源根目录 "raw/acode_debug_server_cert.cer"
+    $调试配置路径 = Join-Path $调试资源根目录 "xml/network_security_config.xml"
+    $已清理 = $false
+
+    if (Test-Path $调试证书路径) {
+        Remove-Item $调试证书路径 -Force
+        $已清理 = $true
+    }
+    if (Test-Path $调试配置路径) {
+        Remove-Item $调试配置路径 -Force
+        $已清理 = $true
+    }
+
+    return $已清理
+}
+
+function 设置平台调试证书信任 {
+    param(
+        [pscustomobject]$调试服务器元数据
+    )
+
+    $主配置路径 = Join-Path $平台根目录 "app/src/main/res/xml/network_security_config.xml"
+    if (-not (Test-Path $主配置路径)) {
+        输出错误 "找不到平台主网络安全配置: $主配置路径"
+        exit 1
+    }
+
+    $调试资源根目录 = Join-Path $平台根目录 "app/src/debug/res"
+    $调试Raw目录 = Join-Path $调试资源根目录 "raw"
+    $调试Xml目录 = Join-Path $调试资源根目录 "xml"
+    $调试证书路径 = Join-Path $调试Raw目录 "acode_debug_server_cert.cer"
+    $调试配置路径 = Join-Path $调试Xml目录 "network_security_config.xml"
+
+    New-Item -ItemType Directory -Path $调试Raw目录 -Force | Out-Null
+    New-Item -ItemType Directory -Path $调试Xml目录 -Force | Out-Null
+
+    Copy-Item $调试服务器元数据.certificatePath $调试证书路径 -Force
+
+    $配置内容 = Get-Content $主配置路径 -Raw -Encoding UTF8
+    $配置内容 = $配置内容 -replace '\s*<certificates src="@raw/acode_debug_server_cert"\s*/>\s*', "`n"
+
+    if ($配置内容 -match '<certificates src="system"\s*/>') {
+        $配置内容 = $配置内容 -replace '<certificates src="system"\s*/>', "<certificates src=`"system`" />`n      <certificates src=`"@raw/acode_debug_server_cert`" />"
+    } elseif ($配置内容 -match '<trust-anchors>') {
+        $配置内容 = $配置内容 -replace '<trust-anchors>', "<trust-anchors>`n      <certificates src=`"@raw/acode_debug_server_cert`" />"
+    } else {
+        输出错误 "平台网络安全配置缺少 trust-anchors，无法注入调试证书。"
+        exit 1
+    }
+
+    [System.IO.File]::WriteAllText($调试配置路径, $配置内容, [System.Text.UTF8Encoding]::new($false))
+    return $true
+}
+
 # ─── 注入 debug 构建改动 ─────────────────────────────────────────────
 function 注入Debug改动 {
     if (-not (Test-Path $平台Assets目录)) {
@@ -1347,6 +1441,9 @@ function 注入Debug改动 {
         }
         if (设置平台终端Axs启动参数 -启用AllowAnyOrigin $false) {
             输出成功 "已清理平台终端 AXS 的调试启动参数注入"
+        }
+        if (清理平台调试证书信任) {
+            输出成功 "已清理平台产物中的调试证书信任注入"
         }
         if (清理平台调试客户端注入) {
             输出成功 "已清理平台产物中的旧调试注入"
@@ -1375,6 +1472,9 @@ function 注入Debug改动 {
         if (设置平台终端Axs启动参数 -启用AllowAnyOrigin $false) {
             输出成功 "已清理平台终端 AXS 的调试启动参数注入"
         }
+        if (清理平台调试证书信任) {
+            输出成功 "已清理平台产物中的调试证书信任注入"
+        }
         if ($已清理旧注入) {
             输出成功 "已清理平台产物中的旧调试注入"
         }
@@ -1384,27 +1484,35 @@ function 注入Debug改动 {
 
     $平台IndexHtml = Join-Path $平台AssetsWww "index.html"
 
-    $内网IP = 获取调试服务器内网IP
-    $调试端口 = 8092
-    if (-not (测试调试服务器可达 -主机 $内网IP -端口 $调试端口)) {
-        输出错误 "已显式请求局域网日志注入，但调试服务器不可达: ${内网IP}:$调试端口"
+    $调试服务器元数据 = 获取调试服务器TLS元数据
+    if (-not $调试服务器元数据) {
+        输出错误 "已显式请求局域网日志注入，但找不到调试服务器元数据。"
         输出错误 "请先启动 scripts/调试服务器.ps1，再重新构建。"
         exit 1
     }
 
-    if (设置平台调试Scheme -Scheme值 "http") {
-        输出成功 "已将平台 Cordova Scheme 设置为 http（允许调试脚本与 ws:// 连接）"
+    if (-not (测试调试服务器可达 -主机 $调试服务器元数据.host -端口 ([int]$调试服务器元数据.port))) {
+        输出错误 "已显式请求局域网日志注入，但调试服务器不可达: $($调试服务器元数据.host):$($调试服务器元数据.port)"
+        输出错误 "请先启动 scripts/调试服务器.ps1，再重新构建。"
+        exit 1
     }
-    if (设置平台终端Axs启动参数 -启用AllowAnyOrigin $true) {
-        输出成功 "已为平台终端 AXS 注入 allow-any-origin 启动参数"
+
+    if (设置平台调试Scheme -Scheme值 $null) {
+        输出成功 "已清理平台产物中的调试 Scheme 注入"
+    }
+    if (设置平台终端Axs启动参数 -启用AllowAnyOrigin $false) {
+        输出成功 "已清理平台终端 AXS 的调试启动参数注入"
+    }
+    if (设置平台调试证书信任 -调试服务器元数据 $调试服务器元数据) {
+        输出成功 "已向平台 debug 产物注入调试服务器证书信任"
     }
 
     $内容 = Get-Content $平台IndexHtml -Raw -Encoding UTF8
-    $调试脚本标签 = "    <!-- HDC_DEBUG --><script src=`"http://${内网IP}:${调试端口}/__debug_client.js`"></script>"
+    $调试脚本标签 = "    <!-- HDC_DEBUG --><script src=`"$($调试服务器元数据.scriptUrl)`"></script>"
     $内容 = $内容 -replace '(\s*<script src="cordova\.js"></script>)', "`n$调试脚本标签`n`$1"
     [System.IO.File]::WriteAllText($平台IndexHtml, $内容, [System.Text.UTF8Encoding]::new($false))
 
-    输出成功 "调试服务器地址: http://${内网IP}:${调试端口}"
+    输出成功 "调试服务器地址: $($调试服务器元数据.scriptUrl)"
     输出成功 "已注入调试客户端到平台 index.html"
 }
 
