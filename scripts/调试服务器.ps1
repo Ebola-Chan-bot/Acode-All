@@ -4,6 +4,7 @@
 .DESCRIPTION
     使用 TcpListener + SslStream 直接监听 HTTPS/WSS（不经 HTTP.sys，无需管理员权限）。
     自动生成并复用局域网调试证书，供构建脚本注入到 Android WebView 调试信任列表。
+    额外提供 AXS 二进制下载端点，供 debug 构建保持与 release 一致的在线下载安装流程。
     通过局域网接收手机端 Acode 的 console 日志，
     监视 www/build/ 变化并通知热重载，可在浏览器查看日志面板。
 .PARAMETER 端口
@@ -202,6 +203,7 @@ function 确保调试服务器证书([string]$主机IP, [int]$目标端口) {
 }
 
 function 写入调试证书元数据([string]$主机IP, [int]$目标端口) {
+    $axsBaseUrl = "https://${主机IP}:${目标端口}/__axs"
     $元数据 = [ordered]@{
         host = $主机IP
         port = $目标端口
@@ -209,6 +211,12 @@ function 写入调试证书元数据([string]$主机IP, [int]$目标端口) {
         wsScheme = "wss"
         scriptUrl = "https://${主机IP}:${目标端口}/__debug_client.js"
         logsUrl = "https://${主机IP}:${目标端口}/__logs"
+        axsBaseUrl = $axsBaseUrl
+        axsUrls = [ordered]@{
+            arm64 = "$axsBaseUrl/axs-musl-android-arm64"
+            armv7 = "$axsBaseUrl/axs-musl-android-armv7"
+            x64 = "$axsBaseUrl/axs-musl-android-x86_64"
+        }
         certificatePath = $调试证书Cer路径
         generatedAt = (Get-Date).ToString("o")
     }
@@ -229,6 +237,33 @@ $MIME类型 = @{
     ".woff2"="font/woff2"; ".ttf"="font/ttf"; ".ico"="image/x-icon"
 }
 $日志级别颜色 = @{ "log"="White"; "info"="Cyan"; "warn"="Yellow"; "error"="Red"; "debug"="Magenta" }
+$script:Axs下载映射 = [ordered]@{
+    "axs-musl-android-arm64" = Join-Path $PSScriptRoot "..\acodex-server\target\aarch64-unknown-linux-musl\release\axs"
+    "axs-musl-android-armv7" = Join-Path $PSScriptRoot "..\acodex-server\target\armv7-unknown-linux-musleabihf\release\axs"
+    "axs-musl-android-x86_64" = Join-Path $PSScriptRoot "..\acodex-server\target\x86_64-unknown-linux-musl\release\axs"
+}
+
+function 获取Axs下载响应 {
+    param(
+        [string]$路径
+    )
+
+    $文件名 = $路径.Substring("/__axs/".Length)
+    if ([string]::IsNullOrWhiteSpace($文件名)) {
+        return @{ 状态 = "404 Not Found"; 类型 = "text/plain; charset=utf-8"; 正文 = [System.Text.Encoding]::UTF8.GetBytes("missing asset name") }
+    }
+
+    if (-not $script:Axs下载映射.Contains($文件名)) {
+        return @{ 状态 = "404 Not Found"; 类型 = "text/plain; charset=utf-8"; 正文 = [System.Text.Encoding]::UTF8.GetBytes("unknown axs asset") }
+    }
+
+    $文件路径 = [System.IO.Path]::GetFullPath($script:Axs下载映射[$文件名])
+    if (-not (Test-Path $文件路径 -PathType Leaf)) {
+        return @{ 状态 = "503 Service Unavailable"; 类型 = "text/plain; charset=utf-8"; 正文 = [System.Text.Encoding]::UTF8.GetBytes("axs artifact unavailable: $文件名") }
+    }
+
+    return @{ 状态 = "200 OK"; 类型 = "application/octet-stream"; 正文 = [System.IO.File]::ReadAllBytes($文件路径) }
+}
 
 # ─── 调试客户端 JS ────────────────────────────────────────────────────
 function 生成调试客户端JS([string]$IP, [int]$P) {
@@ -456,7 +491,6 @@ function 读取WS帧([System.IO.Stream]$流) {
     }
 }
 
-# ─── 应用逻辑 ────────────────────────────────────────────────────────
 $script:WS客户端列表 = [System.Collections.Generic.List[hashtable]]::new()
 
 function 广播([string]$数据) {
@@ -563,17 +597,22 @@ function 处理新连接([System.Net.Sockets.TcpClient]$tcp客户端) {
                 发送HTTP响应 $流 "200 OK" "text/html; charset=utf-8" $正文
             }
             default {
-                $相对路径 = if ($路径 -eq "/") { "index.html" } else { $路径.TrimStart("/") }
-                $文件路径 = Join-Path $Www目录 ($相对路径.Replace("/", "\"))
-                $规范路径 = [System.IO.Path]::GetFullPath($文件路径)
-                if (-not $规范路径.StartsWith($Www目录, [System.StringComparison]::OrdinalIgnoreCase)) {
-                    发送HTTP响应 $流 "403 Forbidden" "text/plain" ([byte[]]@())
-                } elseif (-not (Test-Path $规范路径 -PathType Leaf)) {
-                    发送HTTP响应 $流 "404 Not Found" "text/plain" ([byte[]]@())
+                if ($路径.StartsWith("/__axs/", [System.StringComparison]::Ordinal)) {
+                    $响应 = 获取Axs下载响应 -路径 $路径
+                    发送HTTP响应 $流 $响应.状态 $响应.类型 $响应.正文
                 } else {
-                    $扩展名 = [System.IO.Path]::GetExtension($规范路径)
-                    $类型 = if ($MIME类型[$扩展名]) { $MIME类型[$扩展名] } else { "application/octet-stream" }
-                    发送HTTP响应 $流 "200 OK" $类型 ([System.IO.File]::ReadAllBytes($规范路径))
+                    $相对路径 = if ($路径 -eq "/") { "index.html" } else { $路径.TrimStart("/") }
+                    $文件路径 = Join-Path $Www目录 ($相对路径.Replace("/", [System.IO.Path]::DirectorySeparatorChar))
+                    $规范路径 = [System.IO.Path]::GetFullPath($文件路径)
+                    if (-not $规范路径.StartsWith($Www目录, [System.StringComparison]::OrdinalIgnoreCase)) {
+                        发送HTTP响应 $流 "403 Forbidden" "text/plain" ([byte[]]@())
+                    } elseif (-not (Test-Path $规范路径 -PathType Leaf)) {
+                        发送HTTP响应 $流 "404 Not Found" "text/plain" ([byte[]]@())
+                    } else {
+                        $扩展名 = [System.IO.Path]::GetExtension($规范路径)
+                        $类型 = if ($MIME类型[$扩展名]) { $MIME类型[$扩展名] } else { "application/octet-stream" }
+                        发送HTTP响应 $流 "200 OK" $类型 ([System.IO.File]::ReadAllBytes($规范路径))
+                    }
                 }
             }
         }
@@ -606,6 +645,9 @@ Write-Host "               ║" -ForegroundColor Green
 Write-Host "║ 日志:   " -ForegroundColor Green -NoNewline
 Write-Host "https://${局域网IP}:${端口}/__logs" -ForegroundColor Cyan -NoNewline
 Write-Host "        ║" -ForegroundColor Green
+Write-Host "║ AXS:    " -ForegroundColor Green -NoNewline
+Write-Host "https://${局域网IP}:${端口}/__axs/axs-musl-android-arm64" -ForegroundColor Cyan -NoNewline
+Write-Host " ║" -ForegroundColor Green
 Write-Host "║ 监视:   " -ForegroundColor Green -NoNewline
 if ($监视) { Write-Host "已开启" -ForegroundColor Green -NoNewline } else { Write-Host "未开启" -ForegroundColor DarkGray -NoNewline }
 Write-Host "                              ║" -ForegroundColor Green

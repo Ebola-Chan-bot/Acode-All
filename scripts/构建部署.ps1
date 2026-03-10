@@ -1,23 +1,23 @@
 <#
 .SYNOPSIS
-  一键构建部署脚本 - 将 acodex-server 嵌入 Acode 并构建 APK 部署到手机
+    一键构建部署脚本 - 构建 Acode APK 并部署到手机
 
 .DESCRIPTION
-  自动化完整构建流程：
-  1. 初始化 Git 子模块（Acode + acodex-server），竞速克隆自动选最快线路
-  2. 检测/配置构建环境（JDK, Android SDK, NDK, Rust, Node.js）
-  3. 安装 Node.js 依赖并设置 Cordova 平台
-  4. 交叉编译 acodex-server → Android aarch64 二进制（axs）
-  5. 构建前端资源（rspack）+ 同步到平台目录
-  6. 嵌入 axs 二进制并构建 debug APK
-  7. 通过 ADB 或 HDC 安装到手机
+    自动化完整构建流程：
+    1. 初始化 Git 子模块（Acode + acodex-server），竞速克隆自动选最快线路
+    2. 检测/配置构建环境（JDK, Android SDK, NDK, Rust, Node.js）
+    3. 安装 Node.js 依赖并设置 Cordova 平台
+    4. 按需交叉编译 acodex-server（供 release 发布或 debug 调试服务器分发）
+    5. 构建前端资源（rspack）+ 同步到平台目录
+    6. 对 debug 平台产物动态注入局域网调试与 AXS 下载源
+    7. 通过 ADB 或 HDC 安装到手机
 
 .PARAMETER 动作
   执行的动作（默认 full）：
     full         = 完整流程（首次使用推荐）
     setup        = 仅初始化环境和依赖
     build-server = 仅编译 acodex-server
-        build-apk    = 仅构建 APK（debug 缺少 axs 时会自动补编译）
+        build-apk    = 仅构建 APK（debug 缺少调试用 axs 时会自动补编译）
     deploy       = 仅推送已构建的 APK 到手机
     clean        = 清理构建产物
 
@@ -1204,7 +1204,7 @@ function 编译AcodexServer {
     }
 }
 
-function 确保DebugAxs可用 {
+function 确保DebugAxs下载源可用 {
     if ($构建模式 -ne "debug") {
         return
     }
@@ -1216,7 +1216,7 @@ function 确保DebugAxs可用 {
         return
     }
 
-    输出警告 "debug 模式需要嵌入 axs，当前未检测到编译产物，自动触发 build-server"
+    输出警告 "debug 模式需要通过调试服务器分发 axs，当前未检测到编译产物，自动触发 build-server"
     编译AcodexServer
 }
 
@@ -1368,6 +1368,78 @@ function 获取调试服务器TLS元数据 {
     return $元数据
 }
 
+function 获取调试服务器Axs下载地址 {
+    param(
+        [pscustomobject]$调试服务器元数据
+    )
+
+    $基础地址 = if (-not [string]::IsNullOrWhiteSpace($调试服务器元数据.axsBaseUrl)) {
+        $调试服务器元数据.axsBaseUrl.TrimEnd("/")
+    } else {
+        "https://$($调试服务器元数据.host):$($调试服务器元数据.port)/__axs"
+    }
+
+    return [ordered]@{
+        arm64 = "$基础地址/axs-musl-android-arm64"
+        armv7 = "$基础地址/axs-musl-android-armv7"
+        x64 = "$基础地址/axs-musl-android-x86_64"
+    }
+}
+
+function 重置平台终端Axs下载注入 {
+    $平台终端脚本 = Join-Path $平台AssetsWww "plugins/com.foxdebug.acode.rk.exec.terminal/www/Terminal.js"
+    $平台基线终端脚本 = Join-Path $平台根目录 "platform_www/plugins/com.foxdebug.acode.rk.exec.terminal/www/Terminal.js"
+
+    if (-not (Test-Path $平台基线终端脚本)) {
+        输出错误 "找不到平台终端插件基线脚本: $平台基线终端脚本"
+        exit 1
+    }
+    if (-not (Test-Path $平台终端脚本)) {
+        输出错误 "找不到平台终端插件脚本: $平台终端脚本"
+        exit 1
+    }
+
+    Copy-Item $平台基线终端脚本 $平台终端脚本 -Force
+    return $true
+}
+
+function 设置平台终端Axs下载源 {
+    param(
+        [pscustomobject]$调试服务器元数据
+    )
+
+    $平台终端脚本 = Join-Path $平台AssetsWww "plugins/com.foxdebug.acode.rk.exec.terminal/www/Terminal.js"
+    if (-not (Test-Path $平台终端脚本)) {
+        输出错误 "找不到平台终端插件脚本: $平台终端脚本"
+        exit 1
+    }
+
+    $下载地址 = 获取调试服务器Axs下载地址 -调试服务器元数据 $调试服务器元数据
+    $内容 = Get-Content $平台终端脚本 -Raw -Encoding UTF8
+    $原内容 = $内容
+
+    $替换映射 = [ordered]@{
+        'https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-arm64' = $下载地址.arm64
+        'https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-armv7' = $下载地址.armv7
+        'https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-x86_64' = $下载地址.x64
+    }
+
+    foreach ($原地址 in $替换映射.Keys) {
+        if (-not $内容.Contains($原地址)) {
+            输出错误 "平台终端脚本缺少预期的 AXS 下载地址: $原地址"
+            exit 1
+        }
+        $内容 = $内容.Replace($原地址, $替换映射[$原地址])
+    }
+
+    if ($内容 -eq $原内容) {
+        return $false
+    }
+
+    [System.IO.File]::WriteAllText($平台终端脚本, $内容, [System.Text.UTF8Encoding]::new($false))
+    return $true
+}
+
 function 清理平台调试证书信任 {
     $调试资源根目录 = Join-Path $平台根目录 "app/src/debug/res"
     $调试证书路径 = Join-Path $调试资源根目录 "raw/acode_debug_server_cert.cer"
@@ -1436,6 +1508,9 @@ function 注入Debug改动 {
             输出错误 "release 构建禁止注入调试客户端。"
             exit 1
         }
+        if (重置平台终端Axs下载注入) {
+            输出成功 "已恢复平台终端插件为默认下载行为"
+        }
         if (设置平台调试Scheme -Scheme值 $null) {
             输出成功 "已清理平台产物中的调试 Scheme 注入"
         }
@@ -1454,47 +1529,28 @@ function 注入Debug改动 {
 
     输出步骤 "注入 debug 构建改动"
 
-    $Axs二进制 = Join-Path $Acodex根目录 "target/aarch64-unknown-linux-musl/release/axs"
-    if (-not (Test-Path $Axs二进制)) {
-        输出错误 "debug 模式要求嵌入 axs，但编译产物仍不存在: $Axs二进制"
-        exit 1
-    }
-
-    Copy-Item $Axs二进制 (Join-Path $平台Assets目录 "axs") -Force
-    $大小MB = [math]::Round((Get-Item $Axs二进制).Length / 1MB, 1)
-    输出成功 "axs ($大小MB MB) → assets/axs（debug 嵌入）"
-
     $已清理旧注入 = 清理平台调试客户端注入
-    if (-not $启用调试客户端) {
-        if (设置平台调试Scheme -Scheme值 $null) {
-            输出成功 "已清理平台产物中的调试 Scheme 注入"
-        }
-        if (设置平台终端Axs启动参数 -启用AllowAnyOrigin $false) {
-            输出成功 "已清理平台终端 AXS 的调试启动参数注入"
-        }
-        if (清理平台调试证书信任) {
-            输出成功 "已清理平台产物中的调试证书信任注入"
-        }
-        if ($已清理旧注入) {
-            输出成功 "已清理平台产物中的旧调试注入"
-        }
-        输出成功 "未启用调试客户端注入，构建产物不依赖调试服务器"
-        return
-    }
-
-    $平台IndexHtml = Join-Path $平台AssetsWww "index.html"
 
     $调试服务器元数据 = 获取调试服务器TLS元数据
     if (-not $调试服务器元数据) {
-        输出错误 "已显式请求局域网日志注入，但找不到调试服务器元数据。"
+        输出错误 "debug 构建需要调试服务器提供 AXS 下载，但找不到调试服务器元数据。"
         输出错误 "请先启动 scripts/调试服务器.ps1，再重新构建。"
         exit 1
     }
 
     if (-not (测试调试服务器可达 -主机 $调试服务器元数据.host -端口 ([int]$调试服务器元数据.port))) {
-        输出错误 "已显式请求局域网日志注入，但调试服务器不可达: $($调试服务器元数据.host):$($调试服务器元数据.port)"
+        输出错误 "debug 构建需要调试服务器提供 AXS 下载，但调试服务器不可达: $($调试服务器元数据.host):$($调试服务器元数据.port)"
         输出错误 "请先启动 scripts/调试服务器.ps1，再重新构建。"
         exit 1
+    }
+
+    if (重置平台终端Axs下载注入) {
+        输出成功 "已恢复平台终端插件为源码基线"
+    }
+    if (设置平台终端Axs下载源 -调试服务器元数据 $调试服务器元数据) {
+        $下载地址 = 获取调试服务器Axs下载地址 -调试服务器元数据 $调试服务器元数据
+        输出成功 "已将 debug 构建的 AXS 下载源改为调试服务器"
+        输出成功 "AXS 下载地址: $($下载地址.arm64)"
     }
 
     if (设置平台调试Scheme -Scheme值 $null) {
@@ -1506,6 +1562,16 @@ function 注入Debug改动 {
     if (设置平台调试证书信任 -调试服务器元数据 $调试服务器元数据) {
         输出成功 "已向平台 debug 产物注入调试服务器证书信任"
     }
+
+    if (-not $启用调试客户端) {
+        if ($已清理旧注入) {
+            输出成功 "已清理平台产物中的旧调试注入"
+        }
+        输出成功 "未启用调试客户端注入，但已保留调试服务器 AXS 下载源"
+        return
+    }
+
+    $平台IndexHtml = Join-Path $平台AssetsWww "index.html"
 
     $内容 = Get-Content $平台IndexHtml -Raw -Encoding UTF8
     $调试脚本标签 = "    <!-- HDC_DEBUG --><script src=`"$($调试服务器元数据.scriptUrl)`"></script>"
@@ -1760,7 +1826,7 @@ switch ($动作) {
         安装Node依赖
         开始源码保护
         设置Cordova平台
-        确保DebugAxs可用
+        确保DebugAxs下载源可用
         构建前端
         注入Debug改动
         构建APK
@@ -1781,7 +1847,7 @@ switch ($动作) {
         安装Node依赖
         开始源码保护
         设置Cordova平台
-        确保DebugAxs可用
+        确保DebugAxs下载源可用
         if ($构建模式 -eq "release") {
             编译AcodexServer
         }
