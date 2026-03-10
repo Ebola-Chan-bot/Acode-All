@@ -27,18 +27,39 @@ $日志目录 = Join-Path $PSScriptRoot "logs"
 if (-not (Test-Path $日志目录)) { New-Item -ItemType Directory -Path $日志目录 -Force | Out-Null }
 $证书目录 = Join-Path $PSScriptRoot "certs"
 if (-not (Test-Path $证书目录)) { New-Item -ItemType Directory -Path $证书目录 -Force | Out-Null }
-$日志文件 = Join-Path $日志目录 "调试服务器.log"
+$日志文件 = Join-Path $日志目录 "调试服务器-运行时.log"
 $调试证书Pfx路径 = Join-Path $证书目录 "调试服务器.pfx"
 $调试证书Cer路径 = Join-Path $证书目录 "调试服务器.cer"
 $调试证书元数据路径 = Join-Path $日志目录 "调试服务器-metadata.json"
 $调试证书密码明文 = "Acode-Debug-Tls"
-# 停止已有 Transcript（忽略无活跃 transcript 的错误）
-$旧ErrorPref = $ErrorActionPreference; $ErrorActionPreference = "SilentlyContinue"
-Stop-Transcript 2>$null
-$ErrorActionPreference = $旧ErrorPref
 if (Test-Path $日志文件) { Remove-Item $日志文件 -Force -ErrorAction SilentlyContinue }
-try { Start-Transcript -Path $日志文件 -Force | Out-Null } catch {
-    Write-Warning "Transcript 无法开启: $_  （日志将仅输出到控制台）"
+
+function 追加调试日志 {
+    param(
+        [string]$消息
+    )
+
+    $时间戳 = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    [System.IO.File]::AppendAllText(
+        $日志文件,
+        "$时间戳 $消息`r`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+}
+
+function 写调试日志 {
+    param(
+        [string]$消息,
+        [string]$颜色 = "White",
+        [switch]$不换行
+    )
+
+    追加调试日志 $消息
+    if ($不换行) {
+        Write-Host $消息 -ForegroundColor $颜色 -NoNewline
+    } else {
+        Write-Host $消息 -ForegroundColor $颜色
+    }
 }
 
 # ─── 局域网 IP ───────────────────────────────────────────────────────
@@ -75,7 +96,7 @@ function 清理端口占用([int]$目标端口) {
         if ($进程ID -and $进程ID -gt 4 -and $进程ID -ne $PID) {
             try {
                 Stop-Process -Id $进程ID -Force -ErrorAction Stop
-                Write-Host "  ⚠ 已终止占用端口 $目标端口 的进程 PID=$进程ID" -ForegroundColor Yellow
+                写调试日志 "  ⚠ 已终止占用端口 $目标端口 的进程 PID=$进程ID" Yellow
             } catch {}
         }
     }
@@ -89,7 +110,7 @@ function 配置防火墙([int]$目标端口) {
         if (($输出 -join "`n") -match "No rules match|没有与指定条件匹配的规则") {
             & netsh advfirewall firewall add rule name="$规则名" dir=in action=allow protocol=TCP localport=$目标端口 | Out-Null
             if ($LASTEXITCODE -eq 0) {
-                Write-Host "  ✓ 已添加防火墙入站规则: TCP/$目标端口" -ForegroundColor Green
+                写调试日志 "  ✓ 已添加防火墙入站规则: TCP/$目标端口" Green
             }
         }
     } catch {}
@@ -272,16 +293,32 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
   if(window.__HDC_DEBUG_ACTIVE)return;
   window.__HDC_DEBUG_ACTIVE=true;
     var WS_URL="wss://${IP}:${P}";
-  var ws=null,queue=[],reconnectTimer=null;
+    var ws=null,queue=[],reconnectTimer=null;
+    function safeText(value){
+        if(value===undefined)return "undefined";
+        if(value===null)return "null";
+        if(typeof value==="string")return value;
+        if(value instanceof Error)return (value.message||String(value))+(value.stack?"\n"+value.stack:"");
+        try{return JSON.stringify(value,function(k,val){
+            if(typeof val==="function")return "[Function]";
+            if(typeof HTMLElement!=="undefined"&&val instanceof HTMLElement)return val.outerHTML.substring(0,200);
+            return val;
+        })}catch(e){return "[无法序列化]"}
+    }
   function connect(){
-    try{ws=new WebSocket(WS_URL)}catch(e){return}
-    ws.onopen=function(){while(queue.length)ws.send(queue.shift())};
-    ws.onclose=function(){ws=null;if(!reconnectTimer)reconnectTimer=setTimeout(function(){reconnectTimer=null;connect()},3000)};
-    ws.onerror=function(){};
+        try{ws=new WebSocket(WS_URL)}catch(e){return}
+        ws.onopen=function(){
+            while(queue.length)ws.send(queue.shift())
+        };
+        ws.onclose=function(){
+            ws=null;
+            if(!reconnectTimer)reconnectTimer=setTimeout(function(){reconnectTimer=null;connect()},3000)
+        };
+        ws.onerror=function(){};
     ws.onmessage=function(evt){
       try{var msg=JSON.parse(evt.data);
-        if(msg.type==="reload")location.reload();
-        else if(msg.type==="eval"){try{eval(msg.code)}catch(e){send({type:"error",message:e.message,stack:e.stack})}}
+                if(msg.type==="reload")location.reload();
+                else if(msg.type==="eval"){try{eval(msg.code)}catch(e){send({type:"error",message:e.message,stack:e.stack})}}
       }catch(e){}
     };
   }
@@ -290,27 +327,98 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
     if(ws&&ws.readyState===1)ws.send(data);
     else if(queue.length<200)queue.push(data);
   }
+        var debugBuildId=typeof window.__HDC_DEBUG_BUILD_ID==="string"?window.__HDC_DEBUG_BUILD_ID:"";
+        var debugScriptUrl=typeof window.__HDC_DEBUG_SCRIPT_URL==="string"?window.__HDC_DEBUG_SCRIPT_URL:"";
+    window.__HDC_DEBUG_PUSH=function(payload){
+        if(!payload||typeof payload!=="object")return;
+        if(!payload.timestamp)payload.timestamp=Date.now();
+        send(payload);
+    };
+    var terminalMirrorWindowStartedAt=Date.now();
+    var terminalMirrorCharsInWindow=0;
+    var terminalMirrorDropped=0;
+    function resetTerminalMirrorBudgetIfNeeded(){
+        var now=Date.now();
+        if(now-terminalMirrorWindowStartedAt<1000)return;
+        if(terminalMirrorDropped>0){
+            send({type:"console",level:"warn",args:["[terminal-mirror] dropped frames",String(terminalMirrorDropped)],timestamp:now});
+            terminalMirrorDropped=0;
+        }
+        terminalMirrorWindowStartedAt=now;
+        terminalMirrorCharsInWindow=0;
+    }
+    function sanitizeTerminalText(text){
+        return String(text||"")
+            .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g,"")
+            .replace(/\r/g,"")
+            .replace(/\u0000/g,"");
+    }
+    function emitTerminalMirror(url,text){
+        resetTerminalMirrorBudgetIfNeeded();
+        var cleaned=sanitizeTerminalText(text);
+        if(!cleaned.trim())return;
+        if(terminalMirrorCharsInWindow>=32768){
+            terminalMirrorDropped++;
+            return;
+        }
+        if(cleaned.length>2048)cleaned=cleaned.slice(0,2048)+"\n...[truncated]";
+        terminalMirrorCharsInWindow+=cleaned.length;
+        send({type:"console",level:"debug",args:["[terminal]",url,cleaned],timestamp:Date.now()});
+    }
+    function decodeTerminalPayload(data){
+        if(typeof data==="string")return Promise.resolve(data);
+        if(typeof ArrayBuffer!=="undefined"&&data instanceof ArrayBuffer){
+            return Promise.resolve(new TextDecoder("utf-8",{fatal:false}).decode(new Uint8Array(data)));
+        }
+        if(typeof Blob!=="undefined"&&data instanceof Blob){
+            return data.text();
+        }
+        return Promise.resolve("");
+    }
+    function hookTerminalSocket(socket,url){
+        if(typeof url!=="string")return socket;
+        if(url.indexOf("ws://localhost:")!==0||url.indexOf("/terminals/")===-1)return socket;
+        send({type:"console",level:"info",args:["[terminal-mirror] hooked",url],timestamp:Date.now()});
+        socket.addEventListener("message",function(evt){
+            decodeTerminalPayload(evt.data).then(function(text){
+                emitTerminalMirror(url,text);
+            }).catch(function(err){
+                send({type:"console",level:"warn",args:["[terminal-mirror] decode failed",safeText(err)],timestamp:Date.now()});
+            });
+        });
+        return socket;
+    }
+    var NativeWebSocket=window.WebSocket;
+    function PatchedWebSocket(url,protocols){
+        var socket=arguments.length>1?new NativeWebSocket(url,protocols):new NativeWebSocket(url);
+        return hookTerminalSocket(socket,String(url||""));
+    }
+    PatchedWebSocket.prototype=NativeWebSocket.prototype;
+    try{
+        ["CONNECTING","OPEN","CLOSING","CLOSED"].forEach(function(key){
+            Object.defineProperty(PatchedWebSocket,key,{value:NativeWebSocket[key]});
+        });
+    }catch(e){}
+    window.WebSocket=PatchedWebSocket;
+        if(debugBuildId){
+                send({type:"console",level:"info",args:["[debug-build]","buildId="+debugBuildId,"scriptUrl="+debugScriptUrl,"href="+location.href],timestamp:Date.now()});
+        }
   var _c={};
   ["log","info","warn","error","debug"].forEach(function(l){
     _c[l]=console[l];
     console[l]=function(){
       _c[l].apply(console,arguments);
-      var args=[];
-      for(var i=0;i<arguments.length;i++){
-        try{var v=arguments[i];
-          if(v instanceof Error)args.push({message:v.message,stack:v.stack});
-          else if(typeof v==="object")args.push(JSON.parse(JSON.stringify(v,function(k,val){
-            if(typeof val==="function")return"[Function]";
-            if(val instanceof HTMLElement)return val.outerHTML.substring(0,200);
-            return val})));
-          else args.push(v);
-        }catch(e){args.push("[无法序列化]")}
-      }
+            var args=[];
+            for(var i=0;i<arguments.length;i++)args.push(safeText(arguments[i]));
       send({type:"console",level:l,args:args,timestamp:Date.now()});
     };
   });
-  window.addEventListener("error",function(e){send({type:"error",message:e.message,filename:e.filename,lineno:e.lineno,colno:e.colno,timestamp:Date.now()})});
-  window.addEventListener("unhandledrejection",function(e){send({type:"error",message:"UnhandledRejection: "+(e.reason&&e.reason.message||e.reason),stack:e.reason&&e.reason.stack,timestamp:Date.now()})});
+    window.addEventListener("error",function(e){
+        send({type:"error",message:e.message,filename:e.filename,lineno:e.lineno,colno:e.colno,timestamp:Date.now()})
+    });
+    window.addEventListener("unhandledrejection",function(e){
+        send({type:"error",message:"UnhandledRejection: "+(e.reason&&e.reason.message||e.reason),stack:e.reason&&e.reason.stack,timestamp:Date.now()})
+    });
   setInterval(function(){send({type:"ping"})},30000);
   connect();
 })();
@@ -499,7 +607,7 @@ function 广播([string]$数据) {
             发送WS文本帧 $script:WS客户端列表[$i].流 $数据
         } catch {
             try { $script:WS客户端列表[$i].TCP.Close() } catch {}
-            Write-Host "[断开] $($script:WS客户端列表[$i].来源)" -ForegroundColor Yellow
+            写调试日志 "[断开] $($script:WS客户端列表[$i].来源)" Yellow
             $script:WS客户端列表.RemoveAt($i)
         }
     }
@@ -507,7 +615,7 @@ function 广播([string]$数据) {
 
 function 处理消息([string]$原始文本) {
     try { $消息 = $原始文本 | ConvertFrom-Json } catch {
-        Write-Host "  [原始] $原始文本" -ForegroundColor DarkGray; return
+        写调试日志 "  [原始] $原始文本" DarkGray; return
     }
     switch ($消息.type) {
         "console" {
@@ -519,6 +627,7 @@ function 处理消息([string]$原始文本) {
             $参数列表 = ($消息.args | ForEach-Object {
                 if ($_ -is [string]) { $_ } else { $_ | ConvertTo-Json -Depth 4 -Compress }
             }) -join " "
+            追加调试日志 "$时间 [$($级别.ToUpper())] $参数列表"
             Write-Host "$时间 " -ForegroundColor DarkGray -NoNewline
             Write-Host "[$($级别.ToUpper())] " -ForegroundColor $颜色 -NoNewline
             Write-Host $参数列表
@@ -528,15 +637,19 @@ function 处理消息([string]$原始文本) {
             $时间 = if ($消息.timestamp) {
                 [DateTimeOffset]::FromUnixTimeMilliseconds([long]$消息.timestamp).LocalDateTime.ToString("HH:mm:ss")
             } else { (Get-Date).ToString("HH:mm:ss") }
+            追加调试日志 "$时间 [未捕获错误] $($消息.message)"
             Write-Host "$时间 " -ForegroundColor DarkGray -NoNewline
             Write-Host "[未捕获错误] " -ForegroundColor Red -NoNewline
             Write-Host $消息.message
-            if ($消息.stack) { Write-Host $消息.stack -ForegroundColor DarkGray }
+            if ($消息.stack) {
+                追加调试日志 $消息.stack
+                Write-Host $消息.stack -ForegroundColor DarkGray
+            }
             广播 $原始文本
         }
         "ping" {}
         default {
-            Write-Host "  [未知] $原始文本" -ForegroundColor DarkGray
+            写调试日志 "  [未知] $原始文本" DarkGray
             广播 $原始文本
         }
     }
@@ -545,6 +658,7 @@ function 处理消息([string]$原始文本) {
 function 处理新连接([System.Net.Sockets.TcpClient]$tcp客户端) {
     $原始流 = $tcp客户端.GetStream()
     $流 = [System.Net.Security.SslStream]::new($原始流, $false)
+    $来源 = try { $tcp客户端.Client.RemoteEndPoint.ToString() } catch { "unknown" }
 
     try {
         $流.AuthenticateAsServer(
@@ -554,6 +668,7 @@ function 处理新连接([System.Net.Sockets.TcpClient]$tcp客户端) {
             $false
         )
     } catch {
+        写调试日志 "[TLS失败] $来源 $($_.Exception.Message)" Red
         try { $流.Dispose() } catch {}
         $tcp客户端.Close()
         return
@@ -564,21 +679,23 @@ function 处理新连接([System.Net.Sockets.TcpClient]$tcp客户端) {
 
     $头部 = 读取HTTP请求 $流
     if (-not $头部) {
+        写调试日志 "[HTTP失败] $来源 未读取到完整请求头" Yellow
         try { $流.Dispose() } catch {}
         $tcp客户端.Close()
         return
     }
 
     $路径 = if ($头部 -match '^\w+\s+(\S+)') { $Matches[1] } else { "/" }
+    $方法 = if ($头部 -match '^(\w+)\s+') { $Matches[1] } else { "UNKNOWN" }
 
     # WebSocket 升级
     if ($头部 -match '(?i)Upgrade:\s*websocket') {
         if (WS握手 $头部 $流) {
-            $来源 = $tcp客户端.Client.RemoteEndPoint.ToString()
-            Write-Host "[连接] $来源" -ForegroundColor Green
+            写调试日志 "[WS连接] $来源 $路径" Green
             $流.ReadTimeout = 5000
             $script:WS客户端列表.Add(@{ 流 = $流; TCP = $tcp客户端; 来源 = $来源 })
         } else {
+            写调试日志 "[WS失败] $来源 $路径 握手失败" Yellow
             try { $流.Dispose() } catch {}
             $tcp客户端.Close()
         }
@@ -586,36 +703,47 @@ function 处理新连接([System.Net.Sockets.TcpClient]$tcp客户端) {
     }
 
     # HTTP 路由
+    $响应状态 = "500 Internal Server Error"
     try {
         switch ($路径) {
             "/__debug_client.js" {
                 $正文 = [System.Text.Encoding]::UTF8.GetBytes((生成调试客户端JS $局域网IP $端口))
-                发送HTTP响应 $流 "200 OK" "application/javascript; charset=utf-8" $正文
+                $响应状态 = "200 OK"
+                发送HTTP响应 $流 $响应状态 "application/javascript; charset=utf-8" $正文
             }
             "/__logs" {
                 $正文 = [System.Text.Encoding]::UTF8.GetBytes((生成日志查看器HTML))
-                发送HTTP响应 $流 "200 OK" "text/html; charset=utf-8" $正文
+                $响应状态 = "200 OK"
+                发送HTTP响应 $流 $响应状态 "text/html; charset=utf-8" $正文
             }
             default {
                 if ($路径.StartsWith("/__axs/", [System.StringComparison]::Ordinal)) {
                     $响应 = 获取Axs下载响应 -路径 $路径
-                    发送HTTP响应 $流 $响应.状态 $响应.类型 $响应.正文
+                    $响应状态 = $响应.状态
+                    发送HTTP响应 $流 $响应状态 $响应.类型 $响应.正文
                 } else {
                     $相对路径 = if ($路径 -eq "/") { "index.html" } else { $路径.TrimStart("/") }
                     $文件路径 = Join-Path $Www目录 ($相对路径.Replace("/", [System.IO.Path]::DirectorySeparatorChar))
                     $规范路径 = [System.IO.Path]::GetFullPath($文件路径)
                     if (-not $规范路径.StartsWith($Www目录, [System.StringComparison]::OrdinalIgnoreCase)) {
-                        发送HTTP响应 $流 "403 Forbidden" "text/plain" ([byte[]]@())
+                        $响应状态 = "403 Forbidden"
+                        发送HTTP响应 $流 $响应状态 "text/plain" ([byte[]]@())
                     } elseif (-not (Test-Path $规范路径 -PathType Leaf)) {
-                        发送HTTP响应 $流 "404 Not Found" "text/plain" ([byte[]]@())
+                        $响应状态 = "404 Not Found"
+                        发送HTTP响应 $流 $响应状态 "text/plain" ([byte[]]@())
                     } else {
                         $扩展名 = [System.IO.Path]::GetExtension($规范路径)
                         $类型 = if ($MIME类型[$扩展名]) { $MIME类型[$扩展名] } else { "application/octet-stream" }
-                        发送HTTP响应 $流 "200 OK" $类型 ([System.IO.File]::ReadAllBytes($规范路径))
+                        $响应状态 = "200 OK"
+                        发送HTTP响应 $流 $响应状态 $类型 ([System.IO.File]::ReadAllBytes($规范路径))
                     }
                 }
             }
         }
+        写调试日志 "[HTTP] $来源 $方法 $路径 -> $响应状态" Cyan
+    } catch {
+        写调试日志 "[HTTP异常] $来源 $方法 $路径 $($_.Exception.Message)" Red
+        throw
     } finally {
         try { $流.Dispose() } catch {}
         $tcp客户端.Close()
@@ -636,26 +764,30 @@ $tcp监听器 = [System.Net.Sockets.TcpListener]::new($绑定地址, $端口)
 $tcp监听器.Start()
 
 Write-Host ""
-Write-Host "╔══════════════════════════════════════════════╗" -ForegroundColor Green
-Write-Host "║     HDC 远程调试服务器已启动                ║" -ForegroundColor Green
-Write-Host "╠══════════════════════════════════════════════╣" -ForegroundColor Green
+写调试日志 "╔══════════════════════════════════════════════╗" Green
+写调试日志 "║     HDC 远程调试服务器已启动                ║" Green
+写调试日志 "╠══════════════════════════════════════════════╣" Green
 Write-Host "║ 局域网: " -ForegroundColor Green -NoNewline
 Write-Host "https://${局域网IP}:${端口}" -ForegroundColor Cyan -NoNewline
 Write-Host "               ║" -ForegroundColor Green
+追加调试日志 "║ 局域网: https://${局域网IP}:${端口}               ║"
 Write-Host "║ 日志:   " -ForegroundColor Green -NoNewline
 Write-Host "https://${局域网IP}:${端口}/__logs" -ForegroundColor Cyan -NoNewline
 Write-Host "        ║" -ForegroundColor Green
+追加调试日志 "║ 日志:   https://${局域网IP}:${端口}/__logs        ║"
 Write-Host "║ AXS:    " -ForegroundColor Green -NoNewline
 Write-Host "https://${局域网IP}:${端口}/__axs/axs-musl-android-arm64" -ForegroundColor Cyan -NoNewline
 Write-Host " ║" -ForegroundColor Green
+追加调试日志 "║ AXS:    https://${局域网IP}:${端口}/__axs/axs-musl-android-arm64 ║"
 Write-Host "║ 监视:   " -ForegroundColor Green -NoNewline
 if ($监视) { Write-Host "已开启" -ForegroundColor Green -NoNewline } else { Write-Host "未开启" -ForegroundColor DarkGray -NoNewline }
 Write-Host "                              ║" -ForegroundColor Green
-Write-Host "╚══════════════════════════════════════════════╝" -ForegroundColor Green
+追加调试日志 "║ 监视:   $(if ($监视) { '已开启' } else { '未开启' })                              ║"
+写调试日志 "╚══════════════════════════════════════════════╝" Green
 Write-Host ""
-Write-Host "提示: 确保手机和电脑在同一局域网" -ForegroundColor DarkGray
-Write-Host "证书: $调试证书Cer路径" -ForegroundColor DarkGray
-Write-Host "元数据: $调试证书元数据路径" -ForegroundColor DarkGray
+写调试日志 "提示: 确保手机和电脑在同一局域网" DarkGray
+写调试日志 "证书: $调试证书Cer路径" DarkGray
+写调试日志 "元数据: $调试证书元数据路径" DarkGray
 Write-Host ""
 
 # ─── 文件监视（独立 Runspace，不依赖 PS 事件队列）─────────────────────

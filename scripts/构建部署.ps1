@@ -34,7 +34,7 @@
   NDK 编译使用的最低 Android API 等级（默认 21）
 
 .PARAMETER 启用调试客户端
-    是否向构建产物注入局域网调试客户端脚本（默认关闭）
+    是否向构建产物注入局域网调试客户端脚本（debug 的 full/build-apk 默认开启）
 
 .EXAMPLE
   .\构建部署.ps1                               # 完整流程
@@ -44,7 +44,7 @@
   .\构建部署.ps1 -动作 deploy                 # 仅推送 APK
   .\构建部署.ps1 -设备模式 hdc                # 使用 HDC 连接华为设备
   .\构建部署.ps1 -构建模式 release            # 构建 release 版
-    .\构建部署.ps1 -动作 build-apk -启用调试客户端 # 构建带调试服务器注入的 debug 包
+    .\构建部署.ps1 -动作 build-apk -启用调试客户端 # 显式构建带调试服务器注入的 debug 包
   .\构建部署.ps1 -动作 clean                  # 清理构建产物
 #>
 
@@ -69,6 +69,10 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
+
+if ($构建模式 -eq "debug" -and ($动作 -eq "full" -or $动作 -eq "build-apk")) {
+    $启用调试客户端 = $true
+}
 
 # ─── 路径配置 ─────────────────────────────────────────────────────────
 $工作区根目录     = Resolve-Path (Join-Path $PSScriptRoot "..")
@@ -1004,6 +1008,11 @@ function 获取本地Cordova插件列表 {
     return @($插件列表)
 }
 
+function 获取本地Cordova插件信息([string]$插件ID) {
+    $本地插件列表 = @(获取本地Cordova插件列表)
+    return $本地插件列表 | Where-Object { $_.ID -eq $插件ID } | Select-Object -First 1
+}
+
 function 获取目录文件签名([string]$目录路径) {
     if (-not (Test-Path $目录路径)) {
         return $null
@@ -1572,13 +1581,18 @@ function 注入Debug改动 {
     }
 
     $平台IndexHtml = Join-Path $平台AssetsWww "index.html"
+    $调试构建标识 = (Get-Date).ToString("yyyyMMdd-HHmmss")
 
     $内容 = Get-Content $平台IndexHtml -Raw -Encoding UTF8
-    $调试脚本标签 = "    <!-- HDC_DEBUG --><script src=`"$($调试服务器元数据.scriptUrl)`"></script>"
+    $调试脚本标签 = @(
+        "    <!-- HDC_DEBUG --><script>window.__HDC_DEBUG_BUILD_ID = '$调试构建标识'; window.__HDC_DEBUG_SCRIPT_URL = '$($调试服务器元数据.scriptUrl)';</script>",
+        "    <!-- HDC_DEBUG --><script src=`"$($调试服务器元数据.scriptUrl)`"></script>"
+    ) -join "`n"
     $内容 = $内容 -replace '(\s*<script src="cordova\.js"></script>)', "`n$调试脚本标签`n`$1"
     [System.IO.File]::WriteAllText($平台IndexHtml, $内容, [System.Text.UTF8Encoding]::new($false))
 
     输出成功 "调试服务器地址: $($调试服务器元数据.scriptUrl)"
+    输出成功 "调试构建标识: $调试构建标识"
     输出成功 "已注入调试客户端到平台 index.html"
 }
 
@@ -1601,6 +1615,42 @@ function 构建前端 {
             exit 1
         }
         输出成功 "前端构建完成"
+    } finally {
+        Pop-Location
+    }
+}
+
+function 同步前端产物到平台 {
+    输出步骤 "同步前端产物到平台"
+
+    Push-Location $Acode根目录
+    try {
+        Write-Host "  Cordova prepare（同步最新 www/build 到 Android 平台）..." -ForegroundColor DarkGray
+        npx cordova prepare android 2>&1 | ForEach-Object { Write-Host "  $_" }
+        if ($LASTEXITCODE -ne 0) {
+            输出错误 "Cordova prepare 同步平台失败"
+            exit 1
+        }
+        $终端插件 = 获取本地Cordova插件信息 "com.foxdebug.acode.rk.exec.terminal"
+        if ($null -eq $终端插件) {
+            输出错误 "未找到本地 Cordova 终端插件定义: com.foxdebug.acode.rk.exec.terminal"
+            exit 1
+        }
+
+        $终端脚本目录 = Join-Path $终端插件.路径 "scripts"
+        foreach ($脚本文件名 in @("init-sandbox.sh", "init-alpine.sh", "rm-wrapper.sh")) {
+            $源文件 = Join-Path $终端脚本目录 $脚本文件名
+            $目标文件 = Join-Path $平台Assets目录 $脚本文件名
+
+            if (-not (Test-Path $源文件)) {
+                输出错误 "终端插件脚本不存在: $源文件"
+                exit 1
+            }
+
+            Copy-Item $源文件 $目标文件 -Force
+        }
+        输出成功 "已同步终端脚本到平台 assets"
+        输出成功 "平台前端资源已同步为最新构建产物"
     } finally {
         Pop-Location
     }
@@ -1828,6 +1878,7 @@ switch ($动作) {
         设置Cordova平台
         确保DebugAxs下载源可用
         构建前端
+        同步前端产物到平台
         注入Debug改动
         构建APK
         验证源码未被修改
@@ -1852,6 +1903,7 @@ switch ($动作) {
             编译AcodexServer
         }
         构建前端
+        同步前端产物到平台
         注入Debug改动
         $APK文件 = 构建APK
         验证源码未被修改
