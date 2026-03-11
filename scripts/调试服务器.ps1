@@ -403,6 +403,9 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
     if(ws&&ws.readyState===1)ws.send(data);
     else if(queue.length<200)queue.push(data);
   }
+    function safeClassName(value){
+        try{return Object.prototype.toString.call(value)}catch(e){return "[class-error]"}
+    }
         var debugBuildId=typeof window.__HDC_DEBUG_BUILD_ID==="string"?window.__HDC_DEBUG_BUILD_ID:"";
         var debugScriptUrl=typeof window.__HDC_DEBUG_SCRIPT_URL==="string"?window.__HDC_DEBUG_SCRIPT_URL:"";
     window.__HDC_DEBUG_PUSH=function(payload){
@@ -410,6 +413,90 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
         if(!payload.timestamp)payload.timestamp=Date.now();
         send(payload);
     };
+    function hookScriptLifecycle(){
+        document.addEventListener("load",function(event){
+            var target=event&&event.target;
+            if(!target||target.tagName!=="SCRIPT")return;
+            send({type:"console",level:"debug",args:["[script-load]",target.src||"[inline]"],timestamp:Date.now()});
+        },true);
+        document.addEventListener("error",function(event){
+            var target=event&&event.target;
+            if(!target||target.tagName!=="SCRIPT")return;
+            send({type:"error",message:"Script load failed: "+(target.src||"[inline]"),timestamp:Date.now()});
+        },true);
+    }
+    function hookFetchApi(){
+        if(typeof window.fetch!=="function")return false;
+        if(window.fetch.__hdcWrapped)return true;
+        var originalFetch=window.fetch;
+        function shouldTraceFetch(resource){
+            var url="";
+            try{
+                if(typeof resource==="string")url=resource;
+                else if(resource&&typeof resource.url==="string")url=resource.url;
+            }catch(e){}
+            return url.indexOf("http://localhost:8767/")===0;
+        }
+        window.fetch=function(resource,options){
+            var trace=shouldTraceFetch(resource);
+            var method=(options&&options.method)||"GET";
+            var url="";
+            try{
+                if(typeof resource==="string")url=resource;
+                else if(resource&&typeof resource.url==="string")url=resource.url;
+            }catch(e){}
+            var startedAt=Date.now();
+            if(trace){
+                send({type:"console",level:"debug",args:["[fetch]",method,url,"begin"],timestamp:startedAt});
+            }
+            var result;
+            try{
+                result=originalFetch.apply(this,arguments);
+            }catch(error){
+                if(trace){
+                    send({type:"error",message:"fetch threw: "+method+" "+url+" "+safeText(error),stack:error&&error.stack,timestamp:Date.now()});
+                }
+                throw error;
+            }
+            if(!result||typeof result.then!=="function")return result;
+            return result.then(function(response){
+                if(trace){
+                    send({type:"console",level:"debug",args:["[fetch]",method,url,"resolved","status="+response.status,"ok="+(!!response.ok),"elapsedMs="+(Date.now()-startedAt)],timestamp:Date.now()});
+                }
+                return response;
+            }).catch(function(error){
+                if(trace){
+                    send({type:"error",message:"fetch rejected: "+method+" "+url+" "+safeText(error),stack:error&&error.stack,timestamp:Date.now()});
+                }
+                throw error;
+            });
+        };
+        window.fetch.__hdcWrapped=true;
+        send({type:"console",level:"info",args:["[fetch-api] hooked"],timestamp:Date.now()});
+        return true;
+    }
+    function hookCordovaModuleApi(){
+        if(!window.cordova||typeof window.cordova.require!=="function")return false;
+        if(window.cordova.require.__hdcWrapped)return true;
+        var originalRequire=window.cordova.require;
+        var originalDefine=typeof window.cordova.define==="function"?window.cordova.define:null;
+        window.cordova.require=function(id){
+            try{return originalRequire.apply(this,arguments)}catch(error){
+                send({type:"error",message:"cordova.require failed: "+id,stack:error&&error.stack,timestamp:Date.now()});
+                throw error;
+            }
+        };
+        window.cordova.require.__hdcWrapped=true;
+        if(originalDefine&&!originalDefine.__hdcWrapped){
+            window.cordova.define=function(id,factory){
+                send({type:"console",level:"debug",args:["[cordova-define]",id],timestamp:Date.now()});
+                return originalDefine.apply(this,arguments);
+            };
+            window.cordova.define.__hdcWrapped=true;
+        }
+        send({type:"console",level:"info",args:["[cordova-api] hooked"],timestamp:Date.now()});
+        return true;
+    }
     var terminalMirrorWindowStartedAt=Date.now();
     var terminalMirrorCharsInWindow=0;
     var terminalMirrorDropped=0;
@@ -480,10 +567,29 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
         if(!target||typeof target[name]!=="function")return false;
         var original=target[name];
         if(original.__hdcWrapped)return true;
+        function wrapTerminalCallback(methodName,callbackIndex,callback,label){
+            if(typeof callback!=="function")return callback;
+            if(callback.__hdcWrappedCallback)return callback;
+            var wrappedCallback=function(){
+                var callbackArgs=[];
+                for(var j=0;j<arguments.length;j++)callbackArgs.push(arguments[j]);
+                send({type:"console",level:label,args:["[terminal-api-stream]",methodName,"callback#"+callbackIndex,safeText(callbackArgs)],timestamp:Date.now()});
+                return callback.apply(this,arguments);
+            };
+            wrappedCallback.__hdcWrappedCallback=true;
+            return wrappedCallback;
+        }
         var wrapped=function(){
             var args=[];
             for(var i=0;i<arguments.length;i++)args.push(arguments[i]);
             send({type:"console",level:"info",args:[wrapperTag,name,"begin",safeText(args)],timestamp:Date.now()});
+            if(name==="install"||name==="startAxs"){
+                for(var k=0;k<args.length;k++){
+                    if(typeof args[k]!=="function")continue;
+                    var callbackLevel=(k===0&&name==="install")||(k===1&&name==="startAxs")?"info":"error";
+                    args[k]=wrapTerminalCallback(name,k,args[k],callbackLevel);
+                }
+            }
             try{
                 var result=original.apply(this,args);
                 if(result&&typeof result.then==="function"){
@@ -523,9 +629,17 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
         if(attempt>=120)return;
         setTimeout(function(){waitTerminalApi(attempt+1)},250);
     })(0);
+    (function waitCordovaApi(attempt){
+        if(hookCordovaModuleApi())return;
+        if(attempt>=120)return;
+        setTimeout(function(){waitCordovaApi(attempt+1)},250);
+    })(0);
+    hookFetchApi();
+    hookScriptLifecycle();
         if(debugBuildId){
                 send({type:"console",level:"info",args:["[debug-build]","buildId="+debugBuildId,"scriptUrl="+debugScriptUrl,"href="+location.href],timestamp:Date.now()});
         }
+    send({type:"console",level:"info",args:["[env]","userAgent="+navigator.userAgent,"processType="+typeof window.process,"processClass="+safeClassName(window.process),"hasCordova="+(!!window.cordova)],timestamp:Date.now()});
   var _c={};
   ["log","info","warn","error","debug"].forEach(function(l){
     _c[l]=console[l];
@@ -537,7 +651,9 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
     };
   });
     window.addEventListener("error",function(e){
-        send({type:"error",message:e.message,filename:e.filename,lineno:e.lineno,colno:e.colno,timestamp:Date.now()})
+        var parts=[e.message];
+        if(e.filename)parts.push("@"+e.filename+":"+e.lineno+":"+e.colno);
+        send({type:"error",message:parts.join(" "),filename:e.filename,lineno:e.lineno,colno:e.colno,stack:e.error&&e.error.stack,timestamp:Date.now()})
     });
     window.addEventListener("unhandledrejection",function(e){
         send({type:"error",message:"UnhandledRejection: "+(e.reason&&e.reason.message||e.reason),stack:e.reason&&e.reason.stack,timestamp:Date.now()})
@@ -760,10 +876,11 @@ function 处理消息([string]$原始文本) {
             $时间 = if ($消息.timestamp) {
                 [DateTimeOffset]::FromUnixTimeMilliseconds([long]$消息.timestamp).LocalDateTime.ToString("HH:mm:ss")
             } else { (Get-Date).ToString("HH:mm:ss") }
-            追加调试日志 "$时间 [未捕获错误] $($消息.message)"
+            $定位 = if ($消息.filename) { " ($($消息.filename):$($消息.lineno):$($消息.colno))" } else { "" }
+            追加调试日志 "$时间 [未捕获错误] $($消息.message)$定位"
             Write-Host "$时间 " -ForegroundColor DarkGray -NoNewline
             Write-Host "[未捕获错误] " -ForegroundColor Red -NoNewline
-            Write-Host $消息.message
+            Write-Host ($消息.message + $定位)
             if ($消息.stack) {
                 追加调试日志 $消息.stack
                 Write-Host $消息.stack -ForegroundColor DarkGray

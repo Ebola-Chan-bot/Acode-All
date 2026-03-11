@@ -122,6 +122,8 @@ function 检查命令($命令, $提示) {
     }
 }
 
+. (Join-Path $PSScriptRoot "构建部署.注入.ps1")
+
 function 获取应用信息 {
     if (-not (Test-Path $配置XML路径)) {
         return @{ 名称 = "app-debug"; 版本 = "0.0.0" }
@@ -200,7 +202,6 @@ function 初始化构建环境 {
     检查命令 "npm" "请安装 npm（随 Node.js 安装）"
     输出成功 "npm: $(npm --version)"
 
-    # JAVA_HOME 自动检测
     if (-not $env:JAVA_HOME -or -not (Test-Path (Join-Path $env:JAVA_HOME 'bin/javac.exe'))) {
         $JDK候选目录 = @(
             'C:\Program Files\Android\openjdk',
@@ -223,7 +224,6 @@ function 初始化构建环境 {
         输出成功 "JAVA_HOME: $env:JAVA_HOME"
     }
 
-    # ANDROID_HOME 自动检测
     if (-not $env:ANDROID_HOME) {
         $SDK候选目录 = @(
             "C:\Program Files (x86)\Android\android-sdk",
@@ -245,14 +245,12 @@ function 初始化构建环境 {
     $env:ANDROID_SDK_ROOT = $env:ANDROID_HOME
     输出成功 "ANDROID_HOME: $env:ANDROID_HOME"
 
-    # 将 platform-tools 加入 PATH（adb 所在目录）
     $PlatformTools目录 = Join-Path $env:ANDROID_HOME "platform-tools"
     if ((Test-Path $PlatformTools目录) -and ($env:PATH -notlike "*$PlatformTools目录*")) {
         $env:PATH = "$PlatformTools目录;$env:PATH"
         输出成功 "已将 platform-tools 添加到 PATH"
     }
 
-    # Android Build Tools：确保安装了最新版，并将 cordova.gradle 中硬编码的版本号替换为实际最新版
     $BuildTools目录 = Join-Path $env:ANDROID_HOME "build-tools"
     $已安装最新版 = if (Test-Path $BuildTools目录) {
         Get-ChildItem $BuildTools目录 -Directory |
@@ -271,7 +269,6 @@ function 初始化构建环境 {
             输出错误 "找不到 sdkmanager，请通过 Android Studio → SDK Manager → SDK Tools → Android SDK Build-Tools 安装"
             exit 1
         }
-        # 查询可用最新版
         $可用列表 = & $SDK管理器 --list 2>&1 | Select-String 'build-tools;' |
             ForEach-Object { ($_ -replace '.*build-tools;(\S+).*','$1').Trim() } |
             Where-Object { $_ -match '^\d+\.\d+\.\d+$' } |
@@ -337,7 +334,6 @@ function 初始化构建环境 {
     }
     输出成功 "Gradle: $(& $script:Gradle路径 --version 2>&1 | Select-Object -First 1)"
 
-    # Rust 工具链（可能不在 PATH 中，自动检测 ~/.cargo/bin）
     if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
         $Cargo二进制目录 = Join-Path $env:USERPROFILE ".cargo\bin"
         if (Test-Path (Join-Path $Cargo二进制目录 "rustup.exe")) {
@@ -351,13 +347,11 @@ function 初始化构建环境 {
     检查命令 "cargo" "请安装 Rust: https://rustup.rs/"
     输出成功 "Rust: $(rustc --version)"
 
-    # zig 工具链（musl 交叉编译所需，axs 运行在 proot Alpine 中需要 musl 链接）
     $script:Zig路径 = $null
     $Zig命令 = Get-Command zig -ErrorAction SilentlyContinue
     if ($Zig命令) {
         $script:Zig路径 = $Zig命令.Source
     } else {
-        # 在 winget 常见安装位置搜索
         $WingetPkg目录 = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages"
         if (Test-Path $WingetPkg目录) {
             $Zig文件 = Get-ChildItem $WingetPkg目录 -Directory -Filter "zig.zig_*" -ErrorAction SilentlyContinue |
@@ -365,7 +359,6 @@ function 初始化构建环境 {
                 Select-Object -First 1
             if ($Zig文件) { $script:Zig路径 = $Zig文件.FullName }
         }
-        # 也检查 winget links 目录
         if (-not $script:Zig路径) {
             $链接路径 = "$env:LOCALAPPDATA\Microsoft\WinGet\Links\zig.exe"
             if (Test-Path $链接路径) { $script:Zig路径 = $链接路径 }
@@ -378,7 +371,6 @@ function 初始化构建环境 {
             exit 1
         }
         winget install zig.zig --accept-source-agreements --accept-package-agreements --silent 2>&1 | ForEach-Object { Write-Host "  $_" }
-        # 安装后搜索 zig.exe
         Start-Sleep -Seconds 2
         $Zig命令 = Get-Command zig -ErrorAction SilentlyContinue
         if ($Zig命令) {
@@ -401,14 +393,12 @@ function 初始化构建环境 {
             exit 1
         }
     }
-    # 确保 zig 所在目录在 PATH 中
     $ZigBin目录 = Split-Path $script:Zig路径
     if ($env:PATH -notlike "*$ZigBin目录*") {
         $env:PATH = "$ZigBin目录;$env:PATH"
     }
     输出成功 "zig: $(& $script:Zig路径 version 2>&1)"
 
-    # cargo-zigbuild（使用 zig 作为 Rust 交叉编译 C linker）
     if (-not (Get-Command cargo-zigbuild -ErrorAction SilentlyContinue)) {
         $CargoZigbuild路径 = Join-Path $env:USERPROFILE ".cargo\bin\cargo-zigbuild.exe"
         if (-not (Test-Path $CargoZigbuild路径)) {
@@ -429,14 +419,11 @@ function 初始化构建环境 {
     }
     输出成功 "cargo-zigbuild: $CargoZigbuild版本"
 
-    # Rust musl target（Alpine proot 环境需要 musl 链接的二进制）
     $已安装Target = rustup target list --installed 2>&1
     if ($已安装Target -notcontains "aarch64-unknown-linux-musl") {
         Write-Host "  添加 Rust target: aarch64-unknown-linux-musl" -ForegroundColor DarkGray
         rustup target add aarch64-unknown-linux-musl 2>&1 | ForEach-Object { Write-Host "  $_" }
 
-        # 某些环境曾通过镜像拉取过 stable manifest，component URL 会被缓存为绝对地址。
-        # 仅设置环境变量不够，必须先用官方源刷新 manifest，再重新安装 target。
         $验证Target = rustup target list --installed 2>&1
         if ($验证Target -notcontains "aarch64-unknown-linux-musl") {
             输出警告 "镜像下载失败，临时使用官方源刷新工具链并重试"
@@ -455,7 +442,6 @@ function 初始化构建环境 {
 
             rustup target add aarch64-unknown-linux-musl 2>&1 | ForEach-Object { Write-Host "  $_" }
 
-            # 恢复镜像设置
             if ($null -eq $原RUSTUP_DIST_SERVER) {
                 Remove-Item Env:RUSTUP_DIST_SERVER -ErrorAction SilentlyContinue
             } else {
@@ -532,7 +518,6 @@ function 查找NDK工具链 {
 
 # ─── 子模块 URL 配置 ──────────────────────────────────────────────────
 $子模块名称列表 = @("Acode", "acodex-server", "acode-plugin-github")
-# 每个子模块工作树中用于判断"已正确检出"的关键文件（相对路径）
 $子模块校验文件 = @{
     "Acode"               = "package.json"
     "acodex-server"       = "Cargo.toml"
@@ -546,7 +531,7 @@ $子模块原始URL = @{
 }
 
 $镜像前缀列表 = @(
-    "",                      # 直连
+    "",
     "https://ghfast.top/",
     "https://gh-proxy.com/",
     "https://ghp.ci/"
@@ -558,9 +543,7 @@ function 恢复子模块URL {
     $ErrorActionPreference = $原错误策略
 }
 
-# ─── 强制清除子模块缓存 ───────────────────────────────────────────────
 function 强制清除子模块缓存 {
-    # 先终止可能持有文件锁的 git 进程
     Get-Process git, git-remote-https -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 500
 
@@ -598,25 +581,14 @@ function 强制清除子模块缓存 {
     输出成功 "已清除所有子模块缓存和工作目录"
 }
 
-# ─── 竞速克隆 ─────────────────────────────────────────────────────────
-#
-# 策略：
-#   t=0   先用直连启动克隆（后台 Job）
-#   t=10s 若尚未完成，追加第一个镜像并行克隆（允许直连继续）
-#   t=20s 若仍未完成，追加第二个镜像……依此类推
-#   任意 Job 成功 → 立即终止其余所有 Job，以其临时目录为胜出结果
-#   所有 Job 均失败 → 报错退出
-#
-$竞速追加间隔秒 = 10   # 每隔多少秒追加下一条线路
+$竞速追加间隔秒 = 10
 
 function 竞速初始化子模块 {
     $临时根前缀 = Join-Path $工作区根目录 "_竞速克隆_"
 
-    # 清理上次可能残留的临时目录
     Get-ChildItem $工作区根目录 -Directory -Filter "_竞速克隆_*" -ErrorAction SilentlyContinue |
         ForEach-Object { cmd /c "rd /s /q `"$($_.FullName)`"" 2>&1 | Out-Null }
 
-    # Job 脚本块：逐个子模块克隆到临时目录
     $Job脚本 = {
         param($临时克隆目录, $镜像前缀, $子模块原始URL)
 
@@ -652,7 +624,6 @@ function 竞速初始化子模块 {
     Write-Host "  竞速克隆：共 $镜像总数 条线路，每 ${竞速追加间隔秒}s 无进展则追加下一条" -ForegroundColor DarkGray
 
     while ($true) {
-        # 按时间窗口追加下一条线路
         $应启动数 = [math]::Min(
             [math]::Floor($计时器.Elapsed.TotalSeconds / $竞速追加间隔秒) + 1,
             $镜像总数
@@ -667,7 +638,6 @@ function 竞速初始化子模块 {
             $已启动线路数++
         }
 
-        # 检查是否有 Job 完成
         foreach ($条目 in @($活跃Job列表)) {
             $job状态 = $条目.Job.State
             if ($job状态 -in @('Completed', 'Failed', 'Stopped')) {
@@ -688,7 +658,6 @@ function 竞速初始化子模块 {
 
         if ($胜出条目) { break }
 
-        # 所有 Job 全部失败且无更多线路可加
         if ($活跃Job列表.Count -eq 0 -and $已启动线路数 -ge $镜像总数) {
             输出错误 "所有克隆线路均失败"
             exit 1
@@ -697,7 +666,6 @@ function 竞速初始化子模块 {
         Start-Sleep -Milliseconds 500
     }
 
-    # 终止并清理其余 Job 及其临时目录
     foreach ($条目 in @($活跃Job列表)) {
         Stop-Job $条目.Job -ErrorAction SilentlyContinue
         Remove-Job $条目.Job -Force -ErrorAction SilentlyContinue
@@ -707,7 +675,6 @@ function 竞速初始化子模块 {
         }
     }
 
-    # 把胜出临时目录中的子模块移入正式位置
     输出步骤 "将克隆结果移入工作区"
     foreach ($名称 in $子模块名称列表) {
         $来源 = Join-Path $胜出条目.临时目录 $名称
@@ -716,26 +683,21 @@ function 竞速初始化子模块 {
         Move-Item $来源 $目标 -Force
         输出成功 "$名称 已就位"
     }
-    # 清理胜出临时目录空壳
     if (Test-Path $胜出条目.临时目录) {
         cmd /c "rd /s /q `"$($胜出条目.临时目录)`"" 2>&1 | Out-Null
     }
 
-    # 向父仓库注册子模块
     $原错误策略 = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     git submodule init 2>&1 | Out-Null
     $ErrorActionPreference = $原错误策略
     $原错误策略 = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     foreach ($名称 in $子模块名称列表) {
-        $子目录      = Join-Path $工作区根目录 $名称
-        $子Git路径   = Join-Path $子目录 ".git"
+        $子目录       = Join-Path $工作区根目录 $名称
+        $子Git路径    = Join-Path $子目录 ".git"
         $模块缓存目录 = Join-Path $工作区根目录 ".git/modules/$名称"
-        # 用 .NET 方法判断是否为目录（避免 Get-Item 对隐藏目录的访问问题）
         if ([System.IO.Directory]::Exists($子Git路径) -and -not (Test-Path $模块缓存目录)) {
-            # 将子模块 .git 目录移入父仓库 .git/modules/<name>，使其成为正式子模块
             New-Item -ItemType Directory -Path (Split-Path $模块缓存目录) -Force | Out-Null
             Move-Item $子Git路径 $模块缓存目录 -Force
-            # 用 .NET 方法写入，避免 PowerShell 5 的 -Encoding UTF8 带 BOM 导致 git 无法解析
             [System.IO.File]::WriteAllText((Join-Path $子目录 ".git"), "gitdir: ../.git/modules/$名称`n")
             git config -f (Join-Path $模块缓存目录 "config") "core.worktree" "../../../$名称" 2>&1 | Out-Null
         }
@@ -744,14 +706,11 @@ function 竞速初始化子模块 {
     恢复子模块URL
 }
 
-# ─── 子模块初始化（主入口） ───────────────────────────────────────────
 function 初始化子模块 {
     输出步骤 "初始化 Git 子模块（竞速克隆）"
 
     Push-Location $工作区根目录
     try {
-        # 检查是否已全部就绪：.git 存在 + 工作树有内容 + 关键文件存在
-        # 不使用 rev-parse HEAD，因为本地有修改时 submodule commit 引用可能失效
         $需要克隆 = $false
         foreach ($名称 in $子模块名称列表) {
             $子目录 = Join-Path $工作区根目录 $名称
@@ -772,14 +731,12 @@ function 初始化子模块 {
         if (-not $需要克隆) {
             输出成功 "子模块已就绪，跳过克隆"
         } else {
-            # 先尝试标准 git submodule update，限时 30 秒；超时或失败则切换到竞速克隆
             $标准超时秒 = 30
             输出步骤 "尝试标准 git submodule update --init（限时 ${标准超时秒}s）"
             $标准Job = Start-Job -ScriptBlock {
                 param($工作目录)
                 Set-Location $工作目录
                 git submodule update --init --recursive 2>&1
-                # 用特殊标记行传递退出码，因为 Job 的 State 不反映进程退出码
                 Write-Output "___EXIT_CODE___:$LASTEXITCODE"
             } -ArgumentList $工作区根目录
             $标准完成 = $标准Job | Wait-Job -Timeout $标准超时秒
@@ -799,7 +756,6 @@ function 初始化子模块 {
                 Remove-Job $标准Job -Force -ErrorAction SilentlyContinue
             }
 
-            # 验证每个子模块的关键文件是否存在
             $仍需克隆 = $false
             foreach ($名称 in $子模块名称列表) {
                 $子目录 = Join-Path $工作区根目录 $名称
@@ -820,7 +776,6 @@ function 初始化子模块 {
             }
         }
 
-        # 最终验证
         if (-not (Test-Path (Join-Path $Acode根目录 "package.json"))) {
             输出错误 "Acode 子模块未正确检出"
             exit 1
@@ -835,7 +790,6 @@ function 初始化子模块 {
     }
 }
 
-# ─── Node.js 依赖安装 ─────────────────────────────────────────────────
 function 安装Node依赖 {
     输出步骤 "安装 Node.js 依赖"
 
@@ -848,20 +802,15 @@ function 安装Node依赖 {
         }
         输出成功 "依赖安装完成"
 
-        # 校验关键包完整性：若某个包目录内完全没有 .js/.mjs 源码文件（只剩
-        # package.json/README/LICENSE 等元数据），则认为是 npm 部分安装残缺。
-        # 注意：不能用 main 字段指向的路径来判断——很多包的 main 字段本身就不准确。
         $残缺包列表 = [System.Collections.Generic.List[string]]::new()
         $依赖包目录 = Join-Path $Acode根目录 "node_modules"
         Get-ChildItem $依赖包目录 -Directory -ErrorAction SilentlyContinue | ForEach-Object {
             $包配置路径 = Join-Path $_.FullName "package.json"
             if (Test-Path $包配置路径) {
-                # 只对声明了 main 或 exports 的普通 JS 包做检查
                 try {
                     $包配置 = Get-Content $包配置路径 -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
                     $有入口声明 = $包配置.main -or $包配置.exports -or $包配置.module
                     if ($有入口声明) {
-                        # 递归搜索是否有任何 .js/.mjs/.cjs 源码文件
                         $源码文件数 = (Get-ChildItem $_.FullName -Recurse -Include "*.js","*.mjs","*.cjs" -ErrorAction SilentlyContinue |
                             Where-Object { $_.FullName -notmatch '[\\/]__tests__[\\/]|[\\/]test[\\/]' } |
                             Select-Object -First 1).Count
@@ -882,8 +831,6 @@ function 安装Node依赖 {
             输出成功 "依赖重新安装完成"
         }
 
-        # 专项检查：@rspack/core 的 compiled 子目录（打包于 npm tarball 内）
-        # 若该目录缺失则说明 tarball 解压不完整，需单独强制重装该包
         $Rspack核心Compiled = Join-Path $依赖包目录 "@rspack\core\compiled"
         if (-not (Test-Path $Rspack核心Compiled)) {
             输出警告 "@rspack/core 缺少 compiled 目录（npm 解压不完整），正在强制重装..."
@@ -1244,843 +1191,6 @@ function 确保DebugAxs下载源可用 {
     编译AcodexServer
 }
 
-function 获取调试日志注入片段 {
-    param(
-        [pscustomobject]$调试服务器元数据,
-        [string]$调试构建标识
-    )
-
-    $脚本标签 = @(
-        "    <!-- HDC_DEBUG --><script>window.__HDC_DEBUG_BUILD_ID = '$调试构建标识'; window.__HDC_DEBUG_SCRIPT_URL = '$($调试服务器元数据.scriptUrl)';</script>",
-        "    <!-- HDC_DEBUG --><script src=`"$($调试服务器元数据.scriptUrl)`"></script>"
-    ) -join "`n"
-
-    return $脚本标签
-}
-
-function 设置平台文件文本替换 {
-    param(
-        [string]$文件路径,
-        [string]$查找文本,
-        [string]$替换文本,
-        [switch]$允许缺失
-    )
-
-    if (-not (Test-Path $文件路径)) {
-        输出错误 "找不到目标文件: $文件路径"
-        exit 1
-    }
-
-    $内容 = Get-Content $文件路径 -Raw -Encoding UTF8
-    $原内容 = $内容
-    $查找模式 = [regex]::Escape($查找文本)
-    $查找模式 = $查找模式.Replace("`r`n", "\r?\n")
-    $查找模式 = $查找模式.Replace("`n", "\r?\n")
-
-    if (-not [regex]::IsMatch($内容, $查找模式)) {
-        if ($允许缺失) {
-            return $false
-        }
-        输出错误 "目标文件缺少预期文本: $文件路径"
-        exit 1
-    }
-
-    $内容 = [regex]::Replace($内容, $查找模式, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $替换文本 }, 1)
-    if ($内容 -eq $原内容) {
-        return $false
-    }
-
-    [System.IO.File]::WriteAllText($文件路径, $内容, [System.Text.UTF8Encoding]::new($false))
-    return $true
-}
-
-function 清理平台调试客户端注入 {
-    $平台IndexHtml = Join-Path $平台AssetsWww "index.html"
-
-    $内容 = Get-Content $平台IndexHtml -Raw -Encoding UTF8
-    if ($内容 -notmatch "HDC_DEBUG") {
-        return $false
-    }
-
-    $内容 = $内容 -replace '(?s)\s*<!-- HDC_DEBUG -->.*?</script>\s*', "`n"
-    [System.IO.File]::WriteAllText($平台IndexHtml, $内容, [System.Text.UTF8Encoding]::new($false))
-    return $true
-}
-
-function 设置平台终端调试日志注入 {
-    param(
-        [bool]$启用
-    )
-
-    if (-not $启用) {
-        return $false
-    }
-
-    $initSandbox路径 = Join-Path $平台Assets目录 "init-sandbox.sh"
-    $initAlpine路径 = Join-Path $平台Assets目录 "init-alpine.sh"
-    $已注入 = $false
-
-    $sandbox查找 = @'
-ARGS="$ARGS -L"
-
-$PROOT $ARGS /bin/sh $PREFIX/init-alpine.sh "$@"
-'@
-    $sandbox替换 = @'
-ARGS="$ARGS -L"
-
-echo "[sandbox] proot=$PROOT"
-echo "[sandbox] args=$ARGS"
-$PROOT $ARGS /bin/sh $PREFIX/init-alpine.sh "$@"
-PROOT_EXIT=$?
-echo "[sandbox] proot exit=$PROOT_EXIT"
-exit $PROOT_EXIT
-'@
-    if (设置平台文件文本替换 -文件路径 $initSandbox路径 -查找文本 $sandbox查找 -替换文本 $sandbox替换 -允许缺失) {
-        $已注入 = $true
-    }
-
-    $repo查找 = @'
-APK_MAIN_REPO="https://dl-cdn.alpinelinux.org/alpine/v3.21/main"
-APK_COMMUNITY_REPO="https://dl-cdn.alpinelinux.org/alpine/v3.21/community"
-APK_MIRROR_MAIN_REPO="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/main"
-APK_MIRROR_COMMUNITY_REPO="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/community"
-'@
-    $repo替换 = @'
-APK_MAIN_REPO="https://dl-cdn.alpinelinux.org/alpine/v3.21/main"
-APK_COMMUNITY_REPO="https://dl-cdn.alpinelinux.org/alpine/v3.21/community"
-APK_MIRROR_MAIN_REPO="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/main"
-APK_MIRROR_COMMUNITY_REPO="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/community"
-
-diag_log() {
-    echo "[diag] $*"
-}
-
-diag_summary() {
-    echo "[diag-summary] $*"
-}
-
-dump_command_state() {
-    local command_name="$1"
-    local command_path
-    command_path="$(command -v "$command_name" 2>/dev/null || true)"
-    if [ -n "$command_path" ]; then
-        diag_log "command-state name=${command_name} path=${command_path}"
-        ls -l "$command_path" 2>/dev/null || true
-    else
-        diag_log "command-state name=${command_name} path=<missing>"
-    fi
-}
-
-dump_path_state() {
-    local path="$1"
-    if [ -e "$path" ]; then
-        diag_log "path-state path=${path} exists=true"
-        ls -ld "$path" 2>/dev/null || true
-    else
-        diag_log "path-state path=${path} exists=false"
-    fi
-}
-
-dump_package_state() {
-    local package_name="$1"
-    if is_apk_installed "$package_name"; then
-        diag_log "package-state name=${package_name} installed=true"
-    else
-        diag_log "package-state name=${package_name} installed=false"
-    fi
-}
-
-dump_requested_package_state() {
-    local package_name
-    for package_name in "$@"; do
-        [ -z "$package_name" ] && continue
-        dump_package_state "$package_name"
-    done
-
-    dump_command_state sh
-    dump_command_state ash
-    dump_command_state bash
-    dump_command_state wget
-    dump_command_state sed
-    dump_command_state tar
-
-    dump_path_state /bin
-    dump_path_state /bin/sh
-    dump_path_state /bin/ash
-    dump_path_state /bin/bash
-    dump_path_state /usr/bin
-    dump_path_state /usr/bin/wget
-    dump_path_state /usr/share/zoneinfo/UTC
-    dump_path_state /usr/libexec/command-not-found
-    dump_path_state /lib/apk/db/installed
-    dump_path_state /lib/apk/db/scripts.tar
-}
-
-dump_motd_state() {
-    local label="$1"
-    local path="$2"
-
-    if [ -e "$path" ]; then
-        local size="0"
-        size="$(wc -c < "$path" 2>/dev/null || echo 0)"
-        diag_log "motd-state label=${label} path=${path} exists=true size=${size}"
-        sed -n '1,12p' "$path" 2>/dev/null | while IFS= read -r motd_line; do
-            diag_log "motd-body label=${label} | ${motd_line}"
-        done
-    else
-        diag_log "motd-state label=${label} path=${path} exists=false"
-    fi
-}
-
-extract_shebang_interpreter() {
-    local shebang_line="$1"
-    local shebang_body
-
-    case "$shebang_line" in
-        '#!'*)
-            shebang_body=${shebang_line#\#!}
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-
-    set -- $shebang_body
-    [ $# -eq 0 ] && return 1
-    printf '%s\n' "$1"
-}
-
-dump_apk_script_details() {
-    local package_name="$1"
-    local script_entries
-
-    if [ ! -f /lib/apk/db/scripts.tar ]; then
-        diag_log "apk-script package=${package_name} scripts.tar missing"
-        return
-    fi
-
-    script_entries="$(tar -tf /lib/apk/db/scripts.tar 2>/dev/null | grep "^${package_name}\." || true)"
-    if [ -z "$script_entries" ]; then
-        diag_log "apk-script package=${package_name} entries=<none>"
-        return
-    fi
-
-    printf '%s\n' "$script_entries" | while IFS= read -r script_entry; do
-        local first_line
-        local interpreter
-
-        [ -z "$script_entry" ] && continue
-        diag_log "apk-script package=${package_name} entry=${script_entry}"
-
-        first_line="$(tar -xOf /lib/apk/db/scripts.tar "$script_entry" 2>/dev/null | sed -n '1p')"
-        if [ -n "$first_line" ]; then
-            diag_log "apk-script entry=${script_entry} first-line=${first_line}"
-            interpreter="$(extract_shebang_interpreter "$first_line" 2>/dev/null || true)"
-            if [ -n "$interpreter" ]; then
-                if [ -x "$interpreter" ]; then
-                    diag_log "apk-script entry=${script_entry} interpreter=${interpreter} executable=true"
-                else
-                    diag_log "apk-script entry=${script_entry} interpreter=${interpreter} executable=false"
-                fi
-            fi
-        else
-            diag_log "apk-script entry=${script_entry} first-line=<empty>"
-        fi
-
-        tar -xOf /lib/apk/db/scripts.tar "$script_entry" 2>/dev/null | sed -n '1,40p' | while IFS= read -r script_line; do
-            diag_log "apk-script-body entry=${script_entry} | ${script_line}"
-        done
-    done
-}
-
-dump_all_apk_script_entries() {
-    if [ ! -f /lib/apk/db/scripts.tar ]; then
-        diag_log "apk-script entries scripts.tar missing"
-        return
-    fi
-
-    tar -tf /lib/apk/db/scripts.tar 2>/dev/null | sed -n '1,200p' | while IFS= read -r script_entry; do
-        [ -z "$script_entry" ] && continue
-        diag_log "apk-script entry=${script_entry}"
-    done
-}
-
-dump_apk_trigger_state() {
-    local trigger_path
-    for trigger_path in /lib/apk/db/triggers /lib/apk/db/triggers.*; do
-        [ -e "$trigger_path" ] || continue
-        diag_log "apk-trigger path=${trigger_path}"
-        ls -l "$trigger_path" 2>/dev/null || true
-        sed -n '1,120p' "$trigger_path" 2>/dev/null | while IFS= read -r trigger_line; do
-            diag_log "apk-trigger-body path=${trigger_path} | ${trigger_line}"
-        done
-    done
-}
-
-dump_interpreter_candidates() {
-    local candidate
-    for candidate in /bin/sh /bin/ash /bin/bash /bin/busybox /usr/bin/env /usr/bin/bash; do
-        if [ -e "$candidate" ]; then
-            diag_log "interpreter-state path=${candidate} exists=true"
-            ls -l "$candidate" 2>/dev/null || true
-        else
-            diag_log "interpreter-state path=${candidate} exists=false"
-        fi
-    done
-}
-
-dump_apk_failure_context() {
-    local repo_mode="$1"
-    local step_name="$2"
-    shift 2
-
-    diag_summary "apk failure step=${step_name} source=${repo_mode} requested=$*"
-    dump_requested_package_state "$@"
-
-    local package_name
-    for package_name in "$@"; do
-        [ -z "$package_name" ] && continue
-        dump_apk_script_details "$package_name"
-    done
-
-    dump_apk_script_details busybox
-    dump_apk_script_details busybox-binsh
-    dump_apk_script_details alpine-baselayout
-    dump_all_apk_script_entries
-    dump_apk_trigger_state
-    dump_interpreter_candidates
-}
-
-dump_apk_lock_state() {
-    diag_log "apk-lock shell-pid=$$ ppid=$PPID uid=$(id -u 2>/dev/null)"
-    ls -ld /lib/apk/db 2>/dev/null || true
-    ls -l /lib/apk/db/lock 2>/dev/null || echo "[diag] /lib/apk/db/lock missing"
-    ps 2>/dev/null | grep -E 'apk|proot|axs|sh' | grep -v grep || true
-}
-'@
-    if (设置平台文件文本替换 -文件路径 $initAlpine路径 -查找文本 $repo查找 -替换文本 $repo替换 -允许缺失) {
-        $已注入 = $true
-    }
-
-    $runStep查找 = @'
-run_apk_step() {
-    shift
-    "$@"
-    return $?
-}
-'@
-    $runStep替换 = @'
-run_apk_step() {
-    local step_name="$1"
-    local repo_mode="$2"
-    shift
-    shift
-    local log_file="/tmp/apk-step-$$.log"
-
-    diag_log "running ${step_name} source=${repo_mode} command=$*"
-    "$@" >"$log_file" 2>&1
-    local exit_code=$?
-    if [ -f "$log_file" ]; then
-        while IFS= read -r line; do
-            diag_log "${step_name} | ${line}"
-        done < "$log_file"
-        rm -f "$log_file"
-    else
-        diag_log "${step_name} produced no output"
-    fi
-    diag_log "${step_name} exit=${exit_code}"
-    if [ $exit_code -ne 0 ]; then
-        dump_apk_lock_state
-    fi
-    return $exit_code
-}
-'@
-    if (设置平台文件文本替换 -文件路径 $initAlpine路径 -查找文本 $runStep查找 -替换文本 $runStep替换 -允许缺失) {
-        $已注入 = $true
-    }
-
-    $install查找 = @'
-if [ -n "$missing_packages" ]; then
-    echo -e "\e[34;1m[*] \e[0mInstalling packages:$missing_packages\e[0m"
-
-    install_succeeded="false"
-'@
-    $install替换 = @'
-if [ -n "$missing_packages" ]; then
-    echo -e "\e[34;1m[*] \e[0mInstalling packages:$missing_packages\e[0m"
-    diag_log "installing shell-pid=$$ ppid=$PPID missing_packages=$missing_packages"
-    dump_apk_lock_state
-
-    package_list=""
-    for package_name in $missing_packages; do
-        package_list="$package_list $package_name"
-    done
-
-    install_succeeded="false"
-'@
-    if (设置平台文件文本替换 -文件路径 $initAlpine路径 -查找文本 $install查找 -替换文本 $install替换 -允许缺失) {
-        $已注入 = $true
-    }
-
-    $updateFail查找 = @'
-        run_apk_step "apk update package-index" "$repo_mode" apk update
-        if [ $? -ne 0 ]; then
-            echo -e "\e[33;1m[!] \e[0mapk update failed with ${repo_mode} repositories\e[0m"
-            continue
-        fi
-
-        run_apk_step "apk add required-packages" "$repo_mode" apk add $missing_packages
-        if [ $? -ne 0 ]; then
-            echo -e "\e[33;1m[!] \e[0mapk add failed with ${repo_mode} repositories\e[0m"
-            continue
-        fi
-'@
-    $updateFail替换 = @'
-        run_apk_step "apk update package-index" "$repo_mode" apk update
-        if [ $? -ne 0 ]; then
-            echo -e "\e[33;1m[!] \e[0mapk update failed with ${repo_mode} repositories\e[0m"
-            diag_summary "apk failure step=apk update package-index source=${repo_mode}"
-            dump_apk_lock_state
-            continue
-        fi
-
-        run_apk_step "apk add required-packages" "$repo_mode" apk add $missing_packages
-        if [ $? -ne 0 ]; then
-            echo -e "\e[33;1m[!] \e[0mapk add failed with ${repo_mode} repositories\e[0m"
-            dump_apk_failure_context "$repo_mode" "apk add required-packages" $package_list
-            continue
-        fi
-'@
-    if (设置平台文件文本替换 -文件路径 $initAlpine路径 -查找文本 $updateFail查找 -替换文本 $updateFail替换 -允许缺失) {
-        $已注入 = $true
-    }
-
-    $verify查找 = @'
-    # Verify
-    [ -z "$bash_path" ] && echo -e "\e[31;1m[!] \e[0mbash still missing\e[0m"
-'@
-    $verify替换 = @'
-    # Verify
-    dump_apk_lock_state
-    [ -z "$bash_path" ] && echo -e "\e[31;1m[!] \e[0mbash still missing\e[0m"
-'@
-    if (设置平台文件文本替换 -文件路径 $initAlpine路径 -查找文本 $verify查找 -替换文本 $verify替换 -允许缺失) {
-        $已注入 = $true
-    }
-
-    $motdCreate查找 = @'
-if [ "$#" -eq 0 ]; then
-    echo "$$" > "$PREFIX/pid"
-    chmod +x "$PREFIX/axs"
-
-    if [ ! -e "$PREFIX/alpine/etc/acode_motd" ]; then
-'@
-    $motdCreate替换 = @'
-if [ "$#" -eq 0 ]; then
-    echo "$$" > "$PREFIX/pid"
-    chmod +x "$PREFIX/axs"
-
-    dump_motd_state host-before-create "$PREFIX/alpine/etc/acode_motd"
-
-    if [ ! -e "$PREFIX/alpine/etc/acode_motd" ]; then
-'@
-    if (设置平台文件文本替换 -文件路径 $initAlpine路径 -查找文本 $motdCreate查找 -替换文本 $motdCreate替换 -允许缺失) {
-        $已注入 = $true
-    }
-
-    $motdAfter查找 = @'
-EOF
-    fi
-
-    # Create/update initrc (always overwrite to keep in sync with app updates)
-'@
-    $motdAfter替换 = @'
-EOF
-    fi
-
-    dump_motd_state host-after-create "$PREFIX/alpine/etc/acode_motd"
-
-    # Create/update initrc (always overwrite to keep in sync with app updates)
-'@
-    if (设置平台文件文本替换 -文件路径 $initAlpine路径 -查找文本 $motdAfter查找 -替换文本 $motdAfter替换 -允许缺失) {
-        $已注入 = $true
-    }
-
-    $motdShell查找 = @'
-# Display MOTD (only source that reliably runs in proot bash)
-if [ -s /etc/acode_motd ]; then
-    cat /etc/acode_motd
-fi
-'@
-    $motdShell替换 = @'
-# Display MOTD (only source that reliably runs in proot bash)
-if [ -e /etc/acode_motd ]; then
-    _acode_motd_size=$(wc -c < /etc/acode_motd 2>/dev/null || echo 0)
-    printf '[diag-motd] shell path=/etc/acode_motd exists=true size=%s\n' "$_acode_motd_size" >&2
-else
-    printf '[diag-motd] shell path=/etc/acode_motd exists=false\n' >&2
-fi
-
-if [ -s /etc/acode_motd ]; then
-    printf '[diag-motd] about to cat /etc/acode_motd\n' >&2
-    sed -n '1,12p' /etc/acode_motd 2>/dev/null | while IFS= read -r _acode_motd_line; do
-        printf '[diag-motd-body] %s\n' "$_acode_motd_line" >&2
-    done
-    cat /etc/acode_motd
-    _acode_motd_cat_exit=$?
-    printf '[diag-motd] cat exit=%s\n' "$_acode_motd_cat_exit" >&2
-else
-    printf '[diag-motd] shell motd skipped because file is missing or empty\n' >&2
-fi
-'@
-    if (设置平台文件文本替换 -文件路径 $initAlpine路径 -查找文本 $motdShell查找 -替换文本 $motdShell替换 -允许缺失) {
-        $已注入 = $true
-    }
-
-    return $已注入
-}
-
-function 设置平台终端Axs启动参数 {
-    param(
-        [bool]$启用AllowAnyOrigin
-    )
-
-    $平台终端启动脚本 = Join-Path $平台Assets目录 "init-alpine.sh"
-
-    if (-not (Test-Path $平台终端启动脚本)) {
-        输出错误 "找不到平台终端启动脚本: $平台终端启动脚本"
-        exit 1
-    }
-
-    $内容 = Get-Content $平台终端启动脚本 -Raw -Encoding UTF8
-    $原内容 = $内容
-    $内容 = $内容 -replace '"\$PREFIX/axs"\s+--allow-any-origin\s+-c\s+"bash --rcfile /initrc -i"', '"$PREFIX/axs" -c "bash --rcfile /initrc -i"'
-
-    if ($启用AllowAnyOrigin) {
-        $内容 = $内容 -replace '"\$PREFIX/axs" -c "bash --rcfile /initrc -i"', '"$PREFIX/axs" --allow-any-origin -c "bash --rcfile /initrc -i"'
-    }
-
-    if ($内容 -eq $原内容) {
-        return $false
-    }
-
-    [System.IO.File]::WriteAllText($平台终端启动脚本, $内容, [System.Text.UTF8Encoding]::new($false))
-    return $true
-}
-
-function 设置平台调试Scheme {
-    param(
-        [string]$Scheme值
-    )
-
-    $平台ConfigXml = Join-Path $平台根目录 "app/src/main/res/xml/config.xml"
-
-    $配置内容 = Get-Content $平台ConfigXml -Raw -Encoding UTF8
-    $原配置内容 = $配置内容
-    $配置内容 = $配置内容 -replace '(?m)^\s*<preference name="Scheme" value="[^"]*"\s*/>\s*\r?\n?', ''
-
-    if (-not [string]::IsNullOrWhiteSpace($Scheme值)) {
-        $配置内容 = $配置内容 -replace '</widget>', "    <preference name=`"Scheme`" value=`"$Scheme值`" />`n</widget>"
-    }
-
-    if ($配置内容 -eq $原配置内容) {
-        return $false
-    }
-
-    [System.IO.File]::WriteAllText($平台ConfigXml, $配置内容, [System.Text.UTF8Encoding]::new($false))
-    return $true
-}
-
-function 获取调试服务器内网IP {
-    $候选 = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
-        $_.PrefixOrigin -ne "WellKnown" -and
-        $_.IPAddress -notmatch '^169\.254\.' -and
-        $_.IPAddress -ne '127.0.0.1' -and
-        $_.InterfaceAlias -notmatch 'Loopback|vEthernet|Hyper-V|WSL|VirtualBox|VMware|isatap|Teredo|Bluetooth|本地连接\*'
-    }
-
-    $内网IP = ($候选 | Where-Object {
-        $_.InterfaceAlias -match 'WLAN|Wi-Fi|以太网|Ethernet' -and $_.PrefixOrigin -eq 'Dhcp'
-    } | Select-Object -First 1).IPAddress
-    if (-not $内网IP) {
-        $内网IP = ($候选 | Where-Object {
-            $_.PrefixOrigin -eq 'Dhcp' -and (
-                $_.IPAddress -match '^192\.168\.' -or $_.IPAddress -match '^10\.' -or
-                $_.IPAddress -match '^172\.(1[6-9]|2[0-9]|3[0-1])\.'
-            )
-        } | Select-Object -First 1).IPAddress
-    }
-    if (-not $内网IP) {
-        $内网IP = ($候选 | Select-Object -First 1).IPAddress
-    }
-    if (-not $内网IP) {
-        $内网IP = "127.0.0.1"
-    }
-
-    return $内网IP
-}
-
-function 测试调试服务器可达 {
-    param(
-        [string]$主机,
-        [int]$端口
-    )
-
-    try {
-        $客户端 = New-Object System.Net.Sockets.TcpClient
-        $异步结果 = $客户端.BeginConnect($主机, $端口, $null, $null)
-        if (-not $异步结果.AsyncWaitHandle.WaitOne(1500, $false)) {
-            $客户端.Close()
-            return $false
-        }
-
-        $客户端.EndConnect($异步结果)
-        $客户端.Close()
-        return $true
-    } catch {
-        return $false
-    }
-}
-
-function 获取调试服务器TLS元数据 {
-    $元数据路径 = Join-Path $PSScriptRoot "logs/调试服务器-metadata.json"
-    if (-not (Test-Path $元数据路径)) {
-        return $null
-    }
-
-    try {
-        $元数据 = Get-Content $元数据路径 -Raw -Encoding UTF8 | ConvertFrom-Json
-    } catch {
-        输出错误 "调试服务器元数据解析失败: $元数据路径"
-        exit 1
-    }
-
-    if ([string]::IsNullOrWhiteSpace($元数据.host) -or -not $元数据.port) {
-        输出错误 "调试服务器元数据缺少 host/port: $元数据路径"
-        exit 1
-    }
-    if ([string]::IsNullOrWhiteSpace($元数据.certificatePath) -or -not (Test-Path $元数据.certificatePath)) {
-        输出错误 "调试服务器证书不存在: $($元数据.certificatePath)"
-        exit 1
-    }
-    if ($元数据.scheme -ne "https" -or $元数据.wsScheme -ne "wss") {
-        输出错误 "调试服务器未启用 HTTPS/WSS，请先重新启动 scripts/调试服务器.ps1"
-        exit 1
-    }
-    if ($元数据.host -eq "127.0.0.1") {
-        输出错误 "调试服务器当前仅监听本机地址，手机无法通过局域网访问。"
-        exit 1
-    }
-
-    return $元数据
-}
-
-function 获取调试服务器Axs下载地址 {
-    param(
-        [pscustomobject]$调试服务器元数据
-    )
-
-    $基础地址 = if (-not [string]::IsNullOrWhiteSpace($调试服务器元数据.axsBaseUrl)) {
-        $调试服务器元数据.axsBaseUrl.TrimEnd("/")
-    } else {
-        "https://$($调试服务器元数据.host):$($调试服务器元数据.port)/__axs"
-    }
-
-    return [ordered]@{
-        arm64 = "$基础地址/axs-musl-android-arm64"
-        armv7 = "$基础地址/axs-musl-android-armv7"
-        x64 = "$基础地址/axs-musl-android-x86_64"
-    }
-}
-
-function 重置平台终端Axs下载注入 {
-    $平台终端脚本 = Join-Path $平台AssetsWww "plugins/com.foxdebug.acode.rk.exec.terminal/www/Terminal.js"
-    $平台基线终端脚本 = Join-Path $平台根目录 "platform_www/plugins/com.foxdebug.acode.rk.exec.terminal/www/Terminal.js"
-
-    if (-not (Test-Path $平台基线终端脚本)) {
-        输出错误 "找不到平台终端插件基线脚本: $平台基线终端脚本"
-        exit 1
-    }
-    if (-not (Test-Path $平台终端脚本)) {
-        输出错误 "找不到平台终端插件脚本: $平台终端脚本"
-        exit 1
-    }
-
-    Copy-Item $平台基线终端脚本 $平台终端脚本 -Force
-    return $true
-}
-
-function 设置平台终端Axs下载源 {
-    param(
-        [pscustomobject]$调试服务器元数据
-    )
-
-    $平台终端脚本 = Join-Path $平台AssetsWww "plugins/com.foxdebug.acode.rk.exec.terminal/www/Terminal.js"
-    if (-not (Test-Path $平台终端脚本)) {
-        输出错误 "找不到平台终端插件脚本: $平台终端脚本"
-        exit 1
-    }
-
-    $下载地址 = 获取调试服务器Axs下载地址 -调试服务器元数据 $调试服务器元数据
-    $内容 = Get-Content $平台终端脚本 -Raw -Encoding UTF8
-    $原内容 = $内容
-
-    $替换映射 = [ordered]@{
-        'https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-arm64' = $下载地址.arm64
-        'https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-armv7' = $下载地址.armv7
-        'https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-x86_64' = $下载地址.x64
-    }
-
-    foreach ($原地址 in $替换映射.Keys) {
-        if (-not $内容.Contains($原地址)) {
-            输出错误 "平台终端脚本缺少预期的 AXS 下载地址: $原地址"
-            exit 1
-        }
-        $内容 = $内容.Replace($原地址, $替换映射[$原地址])
-    }
-
-    if ($内容 -eq $原内容) {
-        return $false
-    }
-
-    [System.IO.File]::WriteAllText($平台终端脚本, $内容, [System.Text.UTF8Encoding]::new($false))
-    return $true
-}
-
-function 清理平台调试证书信任 {
-    $调试资源根目录 = Join-Path $平台根目录 "app/src/debug/res"
-    $调试证书路径 = Join-Path $调试资源根目录 "raw/acode_debug_server_cert.cer"
-    $调试配置路径 = Join-Path $调试资源根目录 "xml/network_security_config.xml"
-    $已清理 = $false
-
-    if (Test-Path $调试证书路径) {
-        Remove-Item $调试证书路径 -Force
-        $已清理 = $true
-    }
-    if (Test-Path $调试配置路径) {
-        Remove-Item $调试配置路径 -Force
-        $已清理 = $true
-    }
-
-    return $已清理
-}
-
-function 设置平台调试证书信任 {
-    param(
-        [pscustomobject]$调试服务器元数据
-    )
-
-    $主配置路径 = Join-Path $平台根目录 "app/src/main/res/xml/network_security_config.xml"
-    if (-not (Test-Path $主配置路径)) {
-        输出错误 "找不到平台主网络安全配置: $主配置路径"
-        exit 1
-    }
-
-    $调试资源根目录 = Join-Path $平台根目录 "app/src/debug/res"
-    $调试Raw目录 = Join-Path $调试资源根目录 "raw"
-    $调试Xml目录 = Join-Path $调试资源根目录 "xml"
-    $调试证书路径 = Join-Path $调试Raw目录 "acode_debug_server_cert.cer"
-    $调试配置路径 = Join-Path $调试Xml目录 "network_security_config.xml"
-
-    New-Item -ItemType Directory -Path $调试Raw目录 -Force | Out-Null
-    New-Item -ItemType Directory -Path $调试Xml目录 -Force | Out-Null
-
-    Copy-Item $调试服务器元数据.certificatePath $调试证书路径 -Force
-
-    $配置内容 = Get-Content $主配置路径 -Raw -Encoding UTF8
-    $配置内容 = $配置内容 -replace '\s*<certificates src="@raw/acode_debug_server_cert"\s*/>\s*', "`n"
-
-    if ($配置内容 -match '<certificates src="system"\s*/>') {
-        $配置内容 = $配置内容 -replace '<certificates src="system"\s*/>', "<certificates src=`"system`" />`n      <certificates src=`"@raw/acode_debug_server_cert`" />"
-    } elseif ($配置内容 -match '<trust-anchors>') {
-        $配置内容 = $配置内容 -replace '<trust-anchors>', "<trust-anchors>`n      <certificates src=`"@raw/acode_debug_server_cert`" />"
-    } else {
-        输出错误 "平台网络安全配置缺少 trust-anchors，无法注入调试证书。"
-        exit 1
-    }
-
-    [System.IO.File]::WriteAllText($调试配置路径, $配置内容, [System.Text.UTF8Encoding]::new($false))
-    return $true
-}
-
-# ─── 注入 debug 构建改动 ─────────────────────────────────────────────
-function 注入Debug改动 {
-    if (-not (Test-Path $平台Assets目录)) {
-        输出错误 "平台 assets 目录不存在，请先运行: .\构建部署.ps1 -动作 setup"
-        exit 1
-    }
-
-    $需要调试服务器 = ($Axs下载源 -eq "debug-server") -or $注入调试日志
-
-    if (重置平台终端Axs下载注入) {
-        输出成功 "已恢复平台终端插件为源码基线"
-    }
-    if (设置平台调试Scheme -Scheme值 $null) {
-        输出成功 "已清理平台产物中的调试 Scheme 注入"
-    }
-    if (设置平台终端Axs启动参数 -启用AllowAnyOrigin $false) {
-        输出成功 "已清理平台终端 AXS 的调试启动参数注入"
-    }
-    $已清理旧注入 = 清理平台调试客户端注入
-    if (清理平台调试证书信任) {
-        输出成功 "已清理平台产物中的调试证书信任注入"
-    }
-
-    if (-not $需要调试服务器) {
-        if ($已清理旧注入) {
-            输出成功 "已清理平台产物中的旧调试注入"
-        }
-        输出成功 "当前构建不需要任何调试注入"
-        return
-    }
-
-    输出步骤 "应用构建期注入"
-
-    $调试服务器元数据 = 获取调试服务器TLS元数据
-    if (-not $调试服务器元数据) {
-        输出错误 "当前构建配置需要调试服务器，但找不到调试服务器元数据。"
-        输出错误 "请先启动 scripts/调试服务器.ps1，再重新构建。"
-        exit 1
-    }
-
-    if (-not (测试调试服务器可达 -主机 $调试服务器元数据.host -端口 ([int]$调试服务器元数据.port))) {
-        输出错误 "当前构建配置需要调试服务器，但调试服务器不可达: $($调试服务器元数据.host):$($调试服务器元数据.port)"
-        输出错误 "请先启动 scripts/调试服务器.ps1，再重新构建。"
-        exit 1
-    }
-
-    if ($Axs下载源 -eq "debug-server") {
-        if (设置平台终端Axs下载源 -调试服务器元数据 $调试服务器元数据) {
-            $下载地址 = 获取调试服务器Axs下载地址 -调试服务器元数据 $调试服务器元数据
-            输出成功 "已将 AXS 下载源改为调试服务器"
-            输出成功 "AXS 下载地址: $($下载地址.arm64)"
-        }
-    } else {
-        输出成功 "AXS 下载源保持默认 release 地址"
-    }
-
-    if (设置平台调试证书信任 -调试服务器元数据 $调试服务器元数据) {
-        输出成功 "已注入调试服务器证书信任"
-    }
-
-    if ($注入调试日志) {
-        if (设置平台终端调试日志注入 -启用 $true) {
-            输出成功 "已向终端脚本注入调试日志诊断"
-        }
-
-        $平台IndexHtml = Join-Path $平台AssetsWww "index.html"
-        $调试构建标识 = (Get-Date).ToString("yyyyMMdd-HHmmss")
-        $内容 = Get-Content $平台IndexHtml -Raw -Encoding UTF8
-        $调试脚本标签 = 获取调试日志注入片段 -调试服务器元数据 $调试服务器元数据 -调试构建标识 $调试构建标识
-        $内容 = $内容 -replace '(\s*<script src="cordova\.js"></script>)', "`n$调试脚本标签`n`$1"
-        [System.IO.File]::WriteAllText($平台IndexHtml, $内容, [System.Text.UTF8Encoding]::new($false))
-
-        输出成功 "调试服务器地址: $($调试服务器元数据.scriptUrl)"
-        输出成功 "调试构建标识: $调试构建标识"
-        输出成功 "已注入调试日志客户端到平台 index.html"
-    }
-}
-
 # ─── 构建前端资源 ─────────────────────────────────────────────────────
 function 构建前端 {
     输出步骤 "构建前端资源"
@@ -2135,6 +1245,7 @@ function 同步前端产物到平台 {
 
             Copy-Item $源文件 $目标文件 -Force
         }
+
         输出成功 "已同步终端脚本到平台 assets"
         输出成功 "平台前端资源已同步为最新构建产物"
     } finally {

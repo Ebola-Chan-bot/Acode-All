@@ -1,0 +1,8 @@
+2026-03-11 21:02:33,525 - image-mcp - DEBUG - Processing 1 image sources: 0 URLs and 1 local files
+2026-03-11 21:02:33,526 - image-mcp - DEBUG - Processing 1 local files
+2026-03-11 21:02:33,527 - image-mcp - DEBUG - Local image C:/Users/vhtmf/Desktop/screenshot_20260311_210201.jpeg has extension 'jpeg', mapped to content type 'jpeg'
+2026-03-11 21:02:33,527 - image-mcp - DEBUG - Read local image from C:/Users/vhtmf/Desktop/screenshot_20260311_210201.jpeg with 72011 bytes
+2026-03-11 21:02:33,694 - image-mcp - DEBUG - Original image dimensions from C:/Users/vhtmf/Desktop/screenshot_20260311_210201.jpeg: 1260x2720
+2026-03-11 21:02:33,694 - image-mcp - DEBUG - Image format from PIL: JPEG, mode: RGB
+2026-03-11 21:02:33,695 - image-mcp - DEBUG - Creating Image object with format: jpeg
+2026-03-11 21:02:33,695 - image-mcp - DEBUG - Processed 1 images in 0.17 seconds. Success: 1, Failed: 0
