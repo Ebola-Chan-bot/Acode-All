@@ -13,18 +13,94 @@
   监视 www/build/ 变化并推送热重载
 .PARAMETER 仅本机
   仅监听 127.0.0.1
+.PARAMETER 前台
+  前台运行服务器（默认行为为启动后台子进程并立即返回）
 #>
 param(
     [int]$端口 = 8092,
     [switch]$监视,
-    [switch]$仅本机
+    [switch]$仅本机,
+    [switch]$前台,
+    [switch]$内部后台进程
 )
 
 $ErrorActionPreference = "Stop"
 
-# ─── 日志文件 ─────────────────────────────────────────────────────────
-$日志目录 = Join-Path $PSScriptRoot "logs"
+$脚本路径 = $MyInvocation.MyCommand.Path
+$脚本目录 = Split-Path -Parent $脚本路径
+$日志目录 = Join-Path $脚本目录 "logs"
 if (-not (Test-Path $日志目录)) { New-Item -ItemType Directory -Path $日志目录 -Force | Out-Null }
+$后台启动日志 = Join-Path $日志目录 "调试服务器-启动器.log"
+
+function 写启动器日志([string]$消息) {
+    $时间戳 = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    [System.IO.File]::AppendAllText(
+        $后台启动日志,
+        "$时间戳 $消息`r`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+}
+
+function 测试端口可连接([string]$主机, [int]$目标端口, [int]$超时毫秒 = 1000) {
+    $客户端 = $null
+    try {
+        $客户端 = [System.Net.Sockets.TcpClient]::new()
+        $异步结果 = $客户端.BeginConnect($主机, $目标端口, $null, $null)
+        if (-not $异步结果.AsyncWaitHandle.WaitOne($超时毫秒, $false)) {
+            return $false
+        }
+        $客户端.EndConnect($异步结果)
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if ($客户端) { $客户端.Dispose() }
+    }
+}
+
+function 启动调试服务器后台子进程 {
+    if (Test-Path $后台启动日志) { Remove-Item $后台启动日志 -Force -ErrorAction SilentlyContinue }
+    写启动器日志 "准备启动后台调试服务器: 端口=$端口 监视=$([bool]$监视) 仅本机=$([bool]$仅本机)"
+
+    $参数列表 = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", ('"' + $脚本路径 + '"'),
+        "-端口", [string]$端口,
+        "-内部后台进程"
+    )
+
+    if ($监视) { $参数列表 += "-监视" }
+    if ($仅本机) { $参数列表 += "-仅本机" }
+
+    $启动进程 = Start-Process -FilePath "powershell.exe" -ArgumentList $参数列表 -WindowStyle Hidden -PassThru
+    写启动器日志 "后台子进程已创建: PID=$($启动进程.Id)"
+    $目标主机 = if ($仅本机) { "127.0.0.1" } else { "127.0.0.1" }
+
+    for ($i = 0; $i -lt 40; $i++) {
+        Start-Sleep -Milliseconds 250
+        if ($启动进程.HasExited) {
+            写启动器日志 "后台子进程启动失败: PID=$($启动进程.Id) ExitCode=$($启动进程.ExitCode)"
+            throw "调试服务器后台进程启动后立即退出，退出码: $($启动进程.ExitCode)"
+        }
+        if (测试端口可连接 -主机 $目标主机 -目标端口 $端口 -超时毫秒 200) {
+            写启动器日志 "后台调试服务器已就绪: PID=$($启动进程.Id) 端口=$端口"
+            Write-Host "调试服务器已转入后台运行，PID=$($启动进程.Id)，端口=$端口" -ForegroundColor Green
+            Write-Host "运行日志: $后台启动日志" -ForegroundColor DarkGray
+            return
+        }
+    }
+
+    写启动器日志 "后台调试服务器启动超时: PID=$($启动进程.Id) 端口=$端口"
+    throw "调试服务器后台进程已启动，但在限定时间内未监听端口 $端口"
+}
+
+if (-not $前台 -and -not $内部后台进程) {
+    启动调试服务器后台子进程
+    return
+}
+
+# ─── 日志文件 ─────────────────────────────────────────────────────────
 $证书目录 = Join-Path $PSScriptRoot "certs"
 if (-not (Test-Path $证书目录)) { New-Item -ItemType Directory -Path $证书目录 -Force | Out-Null }
 $日志文件 = Join-Path $日志目录 "调试服务器-运行时.log"
@@ -400,6 +476,53 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
         });
     }catch(e){}
     window.WebSocket=PatchedWebSocket;
+    function wrapTerminalMethod(target,name,wrapperTag){
+        if(!target||typeof target[name]!=="function")return false;
+        var original=target[name];
+        if(original.__hdcWrapped)return true;
+        var wrapped=function(){
+            var args=[];
+            for(var i=0;i<arguments.length;i++)args.push(arguments[i]);
+            send({type:"console",level:"info",args:[wrapperTag,name,"begin",safeText(args)],timestamp:Date.now()});
+            try{
+                var result=original.apply(this,args);
+                if(result&&typeof result.then==="function"){
+                    return result.then(function(value){
+                        send({type:"console",level:"info",args:[wrapperTag,name,"resolved",safeText(value)],timestamp:Date.now()});
+                        return value;
+                    }).catch(function(error){
+                        send({type:"console",level:"error",args:[wrapperTag,name,"rejected",safeText(error)],timestamp:Date.now()});
+                        throw error;
+                    });
+                }
+                send({type:"console",level:"info",args:[wrapperTag,name,"returned",safeText(result)],timestamp:Date.now()});
+                return result;
+            }catch(error){
+                send({type:"console",level:"error",args:[wrapperTag,name,"threw",safeText(error)],timestamp:Date.now()});
+                throw error;
+            }
+        };
+        wrapped.__hdcWrapped=true;
+        target[name]=wrapped;
+        return true;
+    }
+    function hookTerminalApi(){
+        var terminal=window.Terminal;
+        if(!terminal||typeof terminal!=="object")return false;
+        var hooked=false;
+        ["isInstalled","install","startAxs","stopAxs","isAxsRunning"].forEach(function(name){
+            if(wrapTerminalMethod(terminal,name,"[terminal-api]"))hooked=true;
+        });
+        return hooked;
+    }
+    (function waitTerminalApi(attempt){
+        if(hookTerminalApi()){
+            send({type:"console",level:"info",args:["[terminal-api] hooked"],timestamp:Date.now()});
+            return;
+        }
+        if(attempt>=120)return;
+        setTimeout(function(){waitTerminalApi(attempt+1)},250);
+    })(0);
         if(debugBuildId){
                 send({type:"console",level:"info",args:["[debug-build]","buildId="+debugBuildId,"scriptUrl="+debugScriptUrl,"href="+location.href],timestamp:Date.now()});
         }

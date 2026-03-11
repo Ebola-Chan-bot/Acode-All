@@ -7,9 +7,9 @@
     1. 初始化 Git 子模块（Acode + acodex-server），竞速克隆自动选最快线路
     2. 检测/配置构建环境（JDK, Android SDK, NDK, Rust, Node.js）
     3. 安装 Node.js 依赖并设置 Cordova 平台
-    4. 按需交叉编译 acodex-server（供 release 发布或 debug 调试服务器分发）
+    4. 按需交叉编译 acodex-server（供 release 发布或调试服务器分发）
     5. 构建前端资源（rspack）+ 同步到平台目录
-    6. 对 debug 平台产物动态注入局域网调试与 AXS 下载源
+    6. 按开关对平台产物动态注入调试日志代码与 AXS 下载源
     7. 通过 ADB 或 HDC 安装到手机
 
 .PARAMETER 动作
@@ -17,7 +17,7 @@
     full         = 完整流程（首次使用推荐）
     setup        = 仅初始化环境和依赖
     build-server = 仅编译 acodex-server
-        build-apk    = 仅构建 APK（debug 缺少调试用 axs 时会自动补编译）
+    build-apk    = 仅构建 APK（仅在使用调试服务器 AXS 下载源时会自动补编译）
     deploy       = 仅推送已构建的 APK 到手机
     clean        = 清理构建产物
 
@@ -33,8 +33,11 @@
 .PARAMETER NDK接口级别
   NDK 编译使用的最低 Android API 等级（默认 21）
 
-.PARAMETER 启用调试客户端
-    是否向构建产物注入局域网调试客户端脚本（debug 的 full/build-apk 默认开启）
+.PARAMETER Axs下载源
+    AXS 下载源: default | debug-server（默认 default）
+
+.PARAMETER 注入调试日志
+    是否向构建产物注入局域网调试日志代码（默认关闭）
 
 .EXAMPLE
   .\构建部署.ps1                               # 完整流程
@@ -44,7 +47,8 @@
   .\构建部署.ps1 -动作 deploy                 # 仅推送 APK
   .\构建部署.ps1 -设备模式 hdc                # 使用 HDC 连接华为设备
   .\构建部署.ps1 -构建模式 release            # 构建 release 版
-    .\构建部署.ps1 -动作 build-apk -启用调试客户端 # 显式构建带调试服务器注入的 debug 包
+    .\构建部署.ps1 -动作 build-apk -Axs下载源 debug-server        # 使用调试服务器分发 AXS
+    .\构建部署.ps1 -动作 build-apk -注入调试日志                 # 注入局域网调试日志代码
   .\构建部署.ps1 -动作 clean                  # 清理构建产物
 #>
 
@@ -61,7 +65,11 @@ param(
     [ValidateSet("paid", "free")]
     [string]$应用类型 = "paid",
 
-    [switch]$启用调试客户端,
+    [ValidateSet("default", "debug-server")]
+    [string]$Axs下载源 = "default",
+
+    [Alias("启用调试客户端")]
+    [switch]$注入调试日志,
 
     [switch]$强制重建平台,
 
@@ -70,8 +78,15 @@ param(
 
 $ErrorActionPreference = "Continue"
 
-if ($构建模式 -eq "debug" -and ($动作 -eq "full" -or $动作 -eq "build-apk")) {
-    $启用调试客户端 = $true
+if ($构建模式 -eq "release") {
+    if ($Axs下载源 -ne "default") {
+        输出错误 "release 构建禁止切换 AXS 下载源。"
+        exit 1
+    }
+    if ($注入调试日志) {
+        输出错误 "release 构建禁止注入调试日志代码。"
+        exit 1
+    }
 }
 
 # ─── 路径配置 ─────────────────────────────────────────────────────────
@@ -1214,7 +1229,7 @@ function 编译AcodexServer {
 }
 
 function 确保DebugAxs下载源可用 {
-    if ($构建模式 -ne "debug") {
+    if ($Axs下载源 -ne "debug-server") {
         return
     }
 
@@ -1225,8 +1240,58 @@ function 确保DebugAxs下载源可用 {
         return
     }
 
-    输出警告 "debug 模式需要通过调试服务器分发 axs，当前未检测到编译产物，自动触发 build-server"
+    输出警告 "当前构建配置需要通过调试服务器分发 axs，未检测到编译产物，自动触发 build-server"
     编译AcodexServer
+}
+
+function 获取调试日志注入片段 {
+    param(
+        [pscustomobject]$调试服务器元数据,
+        [string]$调试构建标识
+    )
+
+    $脚本标签 = @(
+        "    <!-- HDC_DEBUG --><script>window.__HDC_DEBUG_BUILD_ID = '$调试构建标识'; window.__HDC_DEBUG_SCRIPT_URL = '$($调试服务器元数据.scriptUrl)';</script>",
+        "    <!-- HDC_DEBUG --><script src=`"$($调试服务器元数据.scriptUrl)`"></script>"
+    ) -join "`n"
+
+    return $脚本标签
+}
+
+function 设置平台文件文本替换 {
+    param(
+        [string]$文件路径,
+        [string]$查找文本,
+        [string]$替换文本,
+        [switch]$允许缺失
+    )
+
+    if (-not (Test-Path $文件路径)) {
+        输出错误 "找不到目标文件: $文件路径"
+        exit 1
+    }
+
+    $内容 = Get-Content $文件路径 -Raw -Encoding UTF8
+    $原内容 = $内容
+    $查找模式 = [regex]::Escape($查找文本)
+    $查找模式 = $查找模式.Replace("`r`n", "\r?\n")
+    $查找模式 = $查找模式.Replace("`n", "\r?\n")
+
+    if (-not [regex]::IsMatch($内容, $查找模式)) {
+        if ($允许缺失) {
+            return $false
+        }
+        输出错误 "目标文件缺少预期文本: $文件路径"
+        exit 1
+    }
+
+    $内容 = [regex]::Replace($内容, $查找模式, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $替换文本 }, 1)
+    if ($内容 -eq $原内容) {
+        return $false
+    }
+
+    [System.IO.File]::WriteAllText($文件路径, $内容, [System.Text.UTF8Encoding]::new($false))
+    return $true
 }
 
 function 清理平台调试客户端注入 {
@@ -1240,6 +1305,439 @@ function 清理平台调试客户端注入 {
     $内容 = $内容 -replace '(?s)\s*<!-- HDC_DEBUG -->.*?</script>\s*', "`n"
     [System.IO.File]::WriteAllText($平台IndexHtml, $内容, [System.Text.UTF8Encoding]::new($false))
     return $true
+}
+
+function 设置平台终端调试日志注入 {
+    param(
+        [bool]$启用
+    )
+
+    if (-not $启用) {
+        return $false
+    }
+
+    $initSandbox路径 = Join-Path $平台Assets目录 "init-sandbox.sh"
+    $initAlpine路径 = Join-Path $平台Assets目录 "init-alpine.sh"
+    $已注入 = $false
+
+    $sandbox查找 = @'
+ARGS="$ARGS -L"
+
+$PROOT $ARGS /bin/sh $PREFIX/init-alpine.sh "$@"
+'@
+    $sandbox替换 = @'
+ARGS="$ARGS -L"
+
+echo "[sandbox] proot=$PROOT"
+echo "[sandbox] args=$ARGS"
+$PROOT $ARGS /bin/sh $PREFIX/init-alpine.sh "$@"
+PROOT_EXIT=$?
+echo "[sandbox] proot exit=$PROOT_EXIT"
+exit $PROOT_EXIT
+'@
+    if (设置平台文件文本替换 -文件路径 $initSandbox路径 -查找文本 $sandbox查找 -替换文本 $sandbox替换 -允许缺失) {
+        $已注入 = $true
+    }
+
+    $repo查找 = @'
+APK_MAIN_REPO="https://dl-cdn.alpinelinux.org/alpine/v3.21/main"
+APK_COMMUNITY_REPO="https://dl-cdn.alpinelinux.org/alpine/v3.21/community"
+APK_MIRROR_MAIN_REPO="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/main"
+APK_MIRROR_COMMUNITY_REPO="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/community"
+'@
+    $repo替换 = @'
+APK_MAIN_REPO="https://dl-cdn.alpinelinux.org/alpine/v3.21/main"
+APK_COMMUNITY_REPO="https://dl-cdn.alpinelinux.org/alpine/v3.21/community"
+APK_MIRROR_MAIN_REPO="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/main"
+APK_MIRROR_COMMUNITY_REPO="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/community"
+
+diag_log() {
+    echo "[diag] $*"
+}
+
+diag_summary() {
+    echo "[diag-summary] $*"
+}
+
+dump_command_state() {
+    local command_name="$1"
+    local command_path
+    command_path="$(command -v "$command_name" 2>/dev/null || true)"
+    if [ -n "$command_path" ]; then
+        diag_log "command-state name=${command_name} path=${command_path}"
+        ls -l "$command_path" 2>/dev/null || true
+    else
+        diag_log "command-state name=${command_name} path=<missing>"
+    fi
+}
+
+dump_path_state() {
+    local path="$1"
+    if [ -e "$path" ]; then
+        diag_log "path-state path=${path} exists=true"
+        ls -ld "$path" 2>/dev/null || true
+    else
+        diag_log "path-state path=${path} exists=false"
+    fi
+}
+
+dump_package_state() {
+    local package_name="$1"
+    if is_apk_installed "$package_name"; then
+        diag_log "package-state name=${package_name} installed=true"
+    else
+        diag_log "package-state name=${package_name} installed=false"
+    fi
+}
+
+dump_requested_package_state() {
+    local package_name
+    for package_name in "$@"; do
+        [ -z "$package_name" ] && continue
+        dump_package_state "$package_name"
+    done
+
+    dump_command_state sh
+    dump_command_state ash
+    dump_command_state bash
+    dump_command_state wget
+    dump_command_state sed
+    dump_command_state tar
+
+    dump_path_state /bin
+    dump_path_state /bin/sh
+    dump_path_state /bin/ash
+    dump_path_state /bin/bash
+    dump_path_state /usr/bin
+    dump_path_state /usr/bin/wget
+    dump_path_state /usr/share/zoneinfo/UTC
+    dump_path_state /usr/libexec/command-not-found
+    dump_path_state /lib/apk/db/installed
+    dump_path_state /lib/apk/db/scripts.tar
+}
+
+dump_motd_state() {
+    local label="$1"
+    local path="$2"
+
+    if [ -e "$path" ]; then
+        local size="0"
+        size="$(wc -c < "$path" 2>/dev/null || echo 0)"
+        diag_log "motd-state label=${label} path=${path} exists=true size=${size}"
+        sed -n '1,12p' "$path" 2>/dev/null | while IFS= read -r motd_line; do
+            diag_log "motd-body label=${label} | ${motd_line}"
+        done
+    else
+        diag_log "motd-state label=${label} path=${path} exists=false"
+    fi
+}
+
+extract_shebang_interpreter() {
+    local shebang_line="$1"
+    local shebang_body
+
+    case "$shebang_line" in
+        '#!'*)
+            shebang_body=${shebang_line#\#!}
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    set -- $shebang_body
+    [ $# -eq 0 ] && return 1
+    printf '%s\n' "$1"
+}
+
+dump_apk_script_details() {
+    local package_name="$1"
+    local script_entries
+
+    if [ ! -f /lib/apk/db/scripts.tar ]; then
+        diag_log "apk-script package=${package_name} scripts.tar missing"
+        return
+    fi
+
+    script_entries="$(tar -tf /lib/apk/db/scripts.tar 2>/dev/null | grep "^${package_name}\." || true)"
+    if [ -z "$script_entries" ]; then
+        diag_log "apk-script package=${package_name} entries=<none>"
+        return
+    fi
+
+    printf '%s\n' "$script_entries" | while IFS= read -r script_entry; do
+        local first_line
+        local interpreter
+
+        [ -z "$script_entry" ] && continue
+        diag_log "apk-script package=${package_name} entry=${script_entry}"
+
+        first_line="$(tar -xOf /lib/apk/db/scripts.tar "$script_entry" 2>/dev/null | sed -n '1p')"
+        if [ -n "$first_line" ]; then
+            diag_log "apk-script entry=${script_entry} first-line=${first_line}"
+            interpreter="$(extract_shebang_interpreter "$first_line" 2>/dev/null || true)"
+            if [ -n "$interpreter" ]; then
+                if [ -x "$interpreter" ]; then
+                    diag_log "apk-script entry=${script_entry} interpreter=${interpreter} executable=true"
+                else
+                    diag_log "apk-script entry=${script_entry} interpreter=${interpreter} executable=false"
+                fi
+            fi
+        else
+            diag_log "apk-script entry=${script_entry} first-line=<empty>"
+        fi
+
+        tar -xOf /lib/apk/db/scripts.tar "$script_entry" 2>/dev/null | sed -n '1,40p' | while IFS= read -r script_line; do
+            diag_log "apk-script-body entry=${script_entry} | ${script_line}"
+        done
+    done
+}
+
+dump_all_apk_script_entries() {
+    if [ ! -f /lib/apk/db/scripts.tar ]; then
+        diag_log "apk-script entries scripts.tar missing"
+        return
+    fi
+
+    tar -tf /lib/apk/db/scripts.tar 2>/dev/null | sed -n '1,200p' | while IFS= read -r script_entry; do
+        [ -z "$script_entry" ] && continue
+        diag_log "apk-script entry=${script_entry}"
+    done
+}
+
+dump_apk_trigger_state() {
+    local trigger_path
+    for trigger_path in /lib/apk/db/triggers /lib/apk/db/triggers.*; do
+        [ -e "$trigger_path" ] || continue
+        diag_log "apk-trigger path=${trigger_path}"
+        ls -l "$trigger_path" 2>/dev/null || true
+        sed -n '1,120p' "$trigger_path" 2>/dev/null | while IFS= read -r trigger_line; do
+            diag_log "apk-trigger-body path=${trigger_path} | ${trigger_line}"
+        done
+    done
+}
+
+dump_interpreter_candidates() {
+    local candidate
+    for candidate in /bin/sh /bin/ash /bin/bash /bin/busybox /usr/bin/env /usr/bin/bash; do
+        if [ -e "$candidate" ]; then
+            diag_log "interpreter-state path=${candidate} exists=true"
+            ls -l "$candidate" 2>/dev/null || true
+        else
+            diag_log "interpreter-state path=${candidate} exists=false"
+        fi
+    done
+}
+
+dump_apk_failure_context() {
+    local repo_mode="$1"
+    local step_name="$2"
+    shift 2
+
+    diag_summary "apk failure step=${step_name} source=${repo_mode} requested=$*"
+    dump_requested_package_state "$@"
+
+    local package_name
+    for package_name in "$@"; do
+        [ -z "$package_name" ] && continue
+        dump_apk_script_details "$package_name"
+    done
+
+    dump_apk_script_details busybox
+    dump_apk_script_details busybox-binsh
+    dump_apk_script_details alpine-baselayout
+    dump_all_apk_script_entries
+    dump_apk_trigger_state
+    dump_interpreter_candidates
+}
+
+dump_apk_lock_state() {
+    diag_log "apk-lock shell-pid=$$ ppid=$PPID uid=$(id -u 2>/dev/null)"
+    ls -ld /lib/apk/db 2>/dev/null || true
+    ls -l /lib/apk/db/lock 2>/dev/null || echo "[diag] /lib/apk/db/lock missing"
+    ps 2>/dev/null | grep -E 'apk|proot|axs|sh' | grep -v grep || true
+}
+'@
+    if (设置平台文件文本替换 -文件路径 $initAlpine路径 -查找文本 $repo查找 -替换文本 $repo替换 -允许缺失) {
+        $已注入 = $true
+    }
+
+    $runStep查找 = @'
+run_apk_step() {
+    shift
+    "$@"
+    return $?
+}
+'@
+    $runStep替换 = @'
+run_apk_step() {
+    local step_name="$1"
+    local repo_mode="$2"
+    shift
+    shift
+    local log_file="/tmp/apk-step-$$.log"
+
+    diag_log "running ${step_name} source=${repo_mode} command=$*"
+    "$@" >"$log_file" 2>&1
+    local exit_code=$?
+    if [ -f "$log_file" ]; then
+        while IFS= read -r line; do
+            diag_log "${step_name} | ${line}"
+        done < "$log_file"
+        rm -f "$log_file"
+    else
+        diag_log "${step_name} produced no output"
+    fi
+    diag_log "${step_name} exit=${exit_code}"
+    if [ $exit_code -ne 0 ]; then
+        dump_apk_lock_state
+    fi
+    return $exit_code
+}
+'@
+    if (设置平台文件文本替换 -文件路径 $initAlpine路径 -查找文本 $runStep查找 -替换文本 $runStep替换 -允许缺失) {
+        $已注入 = $true
+    }
+
+    $install查找 = @'
+if [ -n "$missing_packages" ]; then
+    echo -e "\e[34;1m[*] \e[0mInstalling packages:$missing_packages\e[0m"
+
+    install_succeeded="false"
+'@
+    $install替换 = @'
+if [ -n "$missing_packages" ]; then
+    echo -e "\e[34;1m[*] \e[0mInstalling packages:$missing_packages\e[0m"
+    diag_log "installing shell-pid=$$ ppid=$PPID missing_packages=$missing_packages"
+    dump_apk_lock_state
+
+    package_list=""
+    for package_name in $missing_packages; do
+        package_list="$package_list $package_name"
+    done
+
+    install_succeeded="false"
+'@
+    if (设置平台文件文本替换 -文件路径 $initAlpine路径 -查找文本 $install查找 -替换文本 $install替换 -允许缺失) {
+        $已注入 = $true
+    }
+
+    $updateFail查找 = @'
+        run_apk_step "apk update package-index" "$repo_mode" apk update
+        if [ $? -ne 0 ]; then
+            echo -e "\e[33;1m[!] \e[0mapk update failed with ${repo_mode} repositories\e[0m"
+            continue
+        fi
+
+        run_apk_step "apk add required-packages" "$repo_mode" apk add $missing_packages
+        if [ $? -ne 0 ]; then
+            echo -e "\e[33;1m[!] \e[0mapk add failed with ${repo_mode} repositories\e[0m"
+            continue
+        fi
+'@
+    $updateFail替换 = @'
+        run_apk_step "apk update package-index" "$repo_mode" apk update
+        if [ $? -ne 0 ]; then
+            echo -e "\e[33;1m[!] \e[0mapk update failed with ${repo_mode} repositories\e[0m"
+            diag_summary "apk failure step=apk update package-index source=${repo_mode}"
+            dump_apk_lock_state
+            continue
+        fi
+
+        run_apk_step "apk add required-packages" "$repo_mode" apk add $missing_packages
+        if [ $? -ne 0 ]; then
+            echo -e "\e[33;1m[!] \e[0mapk add failed with ${repo_mode} repositories\e[0m"
+            dump_apk_failure_context "$repo_mode" "apk add required-packages" $package_list
+            continue
+        fi
+'@
+    if (设置平台文件文本替换 -文件路径 $initAlpine路径 -查找文本 $updateFail查找 -替换文本 $updateFail替换 -允许缺失) {
+        $已注入 = $true
+    }
+
+    $verify查找 = @'
+    # Verify
+    [ -z "$bash_path" ] && echo -e "\e[31;1m[!] \e[0mbash still missing\e[0m"
+'@
+    $verify替换 = @'
+    # Verify
+    dump_apk_lock_state
+    [ -z "$bash_path" ] && echo -e "\e[31;1m[!] \e[0mbash still missing\e[0m"
+'@
+    if (设置平台文件文本替换 -文件路径 $initAlpine路径 -查找文本 $verify查找 -替换文本 $verify替换 -允许缺失) {
+        $已注入 = $true
+    }
+
+    $motdCreate查找 = @'
+if [ "$#" -eq 0 ]; then
+    echo "$$" > "$PREFIX/pid"
+    chmod +x "$PREFIX/axs"
+
+    if [ ! -e "$PREFIX/alpine/etc/acode_motd" ]; then
+'@
+    $motdCreate替换 = @'
+if [ "$#" -eq 0 ]; then
+    echo "$$" > "$PREFIX/pid"
+    chmod +x "$PREFIX/axs"
+
+    dump_motd_state host-before-create "$PREFIX/alpine/etc/acode_motd"
+
+    if [ ! -e "$PREFIX/alpine/etc/acode_motd" ]; then
+'@
+    if (设置平台文件文本替换 -文件路径 $initAlpine路径 -查找文本 $motdCreate查找 -替换文本 $motdCreate替换 -允许缺失) {
+        $已注入 = $true
+    }
+
+    $motdAfter查找 = @'
+EOF
+    fi
+
+    # Create/update initrc (always overwrite to keep in sync with app updates)
+'@
+    $motdAfter替换 = @'
+EOF
+    fi
+
+    dump_motd_state host-after-create "$PREFIX/alpine/etc/acode_motd"
+
+    # Create/update initrc (always overwrite to keep in sync with app updates)
+'@
+    if (设置平台文件文本替换 -文件路径 $initAlpine路径 -查找文本 $motdAfter查找 -替换文本 $motdAfter替换 -允许缺失) {
+        $已注入 = $true
+    }
+
+    $motdShell查找 = @'
+# Display MOTD (only source that reliably runs in proot bash)
+if [ -s /etc/acode_motd ]; then
+    cat /etc/acode_motd
+fi
+'@
+    $motdShell替换 = @'
+# Display MOTD (only source that reliably runs in proot bash)
+if [ -e /etc/acode_motd ]; then
+    _acode_motd_size=$(wc -c < /etc/acode_motd 2>/dev/null || echo 0)
+    printf '[diag-motd] shell path=/etc/acode_motd exists=true size=%s\n' "$_acode_motd_size" >&2
+else
+    printf '[diag-motd] shell path=/etc/acode_motd exists=false\n' >&2
+fi
+
+if [ -s /etc/acode_motd ]; then
+    printf '[diag-motd] about to cat /etc/acode_motd\n' >&2
+    sed -n '1,12p' /etc/acode_motd 2>/dev/null | while IFS= read -r _acode_motd_line; do
+        printf '[diag-motd-body] %s\n' "$_acode_motd_line" >&2
+    done
+    cat /etc/acode_motd
+    _acode_motd_cat_exit=$?
+    printf '[diag-motd] cat exit=%s\n' "$_acode_motd_cat_exit" >&2
+else
+    printf '[diag-motd] shell motd skipped because file is missing or empty\n' >&2
+fi
+'@
+    if (设置平台文件文本替换 -文件路径 $initAlpine路径 -查找文本 $motdShell查找 -替换文本 $motdShell替换 -允许缺失) {
+        $已注入 = $true
+    }
+
+    return $已注入
 }
 
 function 设置平台终端Axs启动参数 {
@@ -1512,88 +2010,75 @@ function 注入Debug改动 {
         exit 1
     }
 
-    if ($构建模式 -eq "release") {
-        if ($启用调试客户端) {
-            输出错误 "release 构建禁止注入调试客户端。"
-            exit 1
-        }
-        if (重置平台终端Axs下载注入) {
-            输出成功 "已恢复平台终端插件为默认下载行为"
-        }
-        if (设置平台调试Scheme -Scheme值 $null) {
-            输出成功 "已清理平台产物中的调试 Scheme 注入"
-        }
-        if (设置平台终端Axs启动参数 -启用AllowAnyOrigin $false) {
-            输出成功 "已清理平台终端 AXS 的调试启动参数注入"
-        }
-        if (清理平台调试证书信任) {
-            输出成功 "已清理平台产物中的调试证书信任注入"
-        }
-        if (清理平台调试客户端注入) {
-            输出成功 "已清理平台产物中的旧调试注入"
-        }
-        输出成功 "release 构建不进行调试注入"
-        return
-    }
-
-    输出步骤 "注入 debug 构建改动"
-
-    $已清理旧注入 = 清理平台调试客户端注入
-
-    $调试服务器元数据 = 获取调试服务器TLS元数据
-    if (-not $调试服务器元数据) {
-        输出错误 "debug 构建需要调试服务器提供 AXS 下载，但找不到调试服务器元数据。"
-        输出错误 "请先启动 scripts/调试服务器.ps1，再重新构建。"
-        exit 1
-    }
-
-    if (-not (测试调试服务器可达 -主机 $调试服务器元数据.host -端口 ([int]$调试服务器元数据.port))) {
-        输出错误 "debug 构建需要调试服务器提供 AXS 下载，但调试服务器不可达: $($调试服务器元数据.host):$($调试服务器元数据.port)"
-        输出错误 "请先启动 scripts/调试服务器.ps1，再重新构建。"
-        exit 1
-    }
+    $需要调试服务器 = ($Axs下载源 -eq "debug-server") -or $注入调试日志
 
     if (重置平台终端Axs下载注入) {
         输出成功 "已恢复平台终端插件为源码基线"
     }
-    if (设置平台终端Axs下载源 -调试服务器元数据 $调试服务器元数据) {
-        $下载地址 = 获取调试服务器Axs下载地址 -调试服务器元数据 $调试服务器元数据
-        输出成功 "已将 debug 构建的 AXS 下载源改为调试服务器"
-        输出成功 "AXS 下载地址: $($下载地址.arm64)"
-    }
-
     if (设置平台调试Scheme -Scheme值 $null) {
         输出成功 "已清理平台产物中的调试 Scheme 注入"
     }
     if (设置平台终端Axs启动参数 -启用AllowAnyOrigin $false) {
         输出成功 "已清理平台终端 AXS 的调试启动参数注入"
     }
-    if (设置平台调试证书信任 -调试服务器元数据 $调试服务器元数据) {
-        输出成功 "已向平台 debug 产物注入调试服务器证书信任"
+    $已清理旧注入 = 清理平台调试客户端注入
+    if (清理平台调试证书信任) {
+        输出成功 "已清理平台产物中的调试证书信任注入"
     }
 
-    if (-not $启用调试客户端) {
+    if (-not $需要调试服务器) {
         if ($已清理旧注入) {
             输出成功 "已清理平台产物中的旧调试注入"
         }
-        输出成功 "未启用调试客户端注入，但已保留调试服务器 AXS 下载源"
+        输出成功 "当前构建不需要任何调试注入"
         return
     }
 
-    $平台IndexHtml = Join-Path $平台AssetsWww "index.html"
-    $调试构建标识 = (Get-Date).ToString("yyyyMMdd-HHmmss")
+    输出步骤 "应用构建期注入"
 
-    $内容 = Get-Content $平台IndexHtml -Raw -Encoding UTF8
-    $调试脚本标签 = @(
-        "    <!-- HDC_DEBUG --><script>window.__HDC_DEBUG_BUILD_ID = '$调试构建标识'; window.__HDC_DEBUG_SCRIPT_URL = '$($调试服务器元数据.scriptUrl)';</script>",
-        "    <!-- HDC_DEBUG --><script src=`"$($调试服务器元数据.scriptUrl)`"></script>"
-    ) -join "`n"
-    $内容 = $内容 -replace '(\s*<script src="cordova\.js"></script>)', "`n$调试脚本标签`n`$1"
-    [System.IO.File]::WriteAllText($平台IndexHtml, $内容, [System.Text.UTF8Encoding]::new($false))
+    $调试服务器元数据 = 获取调试服务器TLS元数据
+    if (-not $调试服务器元数据) {
+        输出错误 "当前构建配置需要调试服务器，但找不到调试服务器元数据。"
+        输出错误 "请先启动 scripts/调试服务器.ps1，再重新构建。"
+        exit 1
+    }
 
-    输出成功 "调试服务器地址: $($调试服务器元数据.scriptUrl)"
-    输出成功 "调试构建标识: $调试构建标识"
-    输出成功 "已注入调试客户端到平台 index.html"
+    if (-not (测试调试服务器可达 -主机 $调试服务器元数据.host -端口 ([int]$调试服务器元数据.port))) {
+        输出错误 "当前构建配置需要调试服务器，但调试服务器不可达: $($调试服务器元数据.host):$($调试服务器元数据.port)"
+        输出错误 "请先启动 scripts/调试服务器.ps1，再重新构建。"
+        exit 1
+    }
+
+    if ($Axs下载源 -eq "debug-server") {
+        if (设置平台终端Axs下载源 -调试服务器元数据 $调试服务器元数据) {
+            $下载地址 = 获取调试服务器Axs下载地址 -调试服务器元数据 $调试服务器元数据
+            输出成功 "已将 AXS 下载源改为调试服务器"
+            输出成功 "AXS 下载地址: $($下载地址.arm64)"
+        }
+    } else {
+        输出成功 "AXS 下载源保持默认 release 地址"
+    }
+
+    if (设置平台调试证书信任 -调试服务器元数据 $调试服务器元数据) {
+        输出成功 "已注入调试服务器证书信任"
+    }
+
+    if ($注入调试日志) {
+        if (设置平台终端调试日志注入 -启用 $true) {
+            输出成功 "已向终端脚本注入调试日志诊断"
+        }
+
+        $平台IndexHtml = Join-Path $平台AssetsWww "index.html"
+        $调试构建标识 = (Get-Date).ToString("yyyyMMdd-HHmmss")
+        $内容 = Get-Content $平台IndexHtml -Raw -Encoding UTF8
+        $调试脚本标签 = 获取调试日志注入片段 -调试服务器元数据 $调试服务器元数据 -调试构建标识 $调试构建标识
+        $内容 = $内容 -replace '(\s*<script src="cordova\.js"></script>)', "`n$调试脚本标签`n`$1"
+        [System.IO.File]::WriteAllText($平台IndexHtml, $内容, [System.Text.UTF8Encoding]::new($false))
+
+        输出成功 "调试服务器地址: $($调试服务器元数据.scriptUrl)"
+        输出成功 "调试构建标识: $调试构建标识"
+        输出成功 "已注入调试日志客户端到平台 index.html"
+    }
 }
 
 # ─── 构建前端资源 ─────────────────────────────────────────────────────
@@ -1602,8 +2087,9 @@ function 构建前端 {
 
     Push-Location $Acode根目录
     try {
-        $配置模式  = if ($构建模式 -eq "release") { "p" } else { "d" }
-        $Rspack模式 = if ($构建模式 -eq "release") { "production" } else { "development" }
+        $前端等效Release = ($构建模式 -eq "release") -or (-not $注入调试日志)
+        $配置模式  = if ($前端等效Release) { "p" } else { "d" }
+        $Rspack模式 = if ($前端等效Release) { "production" } else { "development" }
 
         Write-Host "  配置: mode=$配置模式 app=$应用类型" -ForegroundColor DarkGray
         输出成功 "默认不调用 utils/config.js；如需切换应用类型，需走 Acode 内置配置接口"
