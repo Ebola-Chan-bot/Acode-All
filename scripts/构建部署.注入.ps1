@@ -123,16 +123,16 @@ exit $PROOT_EXIT
     }
 
     $repo查找 = @'
-APK_MAIN_REPO="https://dl-cdn.alpinelinux.org/alpine/v3.21/main"
-APK_COMMUNITY_REPO="https://dl-cdn.alpinelinux.org/alpine/v3.21/community"
-APK_MIRROR_MAIN_REPO="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/main"
-APK_MIRROR_COMMUNITY_REPO="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/community"
+APK_MAIN_REPO="http://dl-cdn.alpinelinux.org/alpine/__ALPINE_BRANCH__/main"
+APK_COMMUNITY_REPO="http://dl-cdn.alpinelinux.org/alpine/__ALPINE_BRANCH__/community"
+APK_MIRROR_MAIN_REPO="http://mirrors.tuna.tsinghua.edu.cn/alpine/__ALPINE_BRANCH__/main"
+APK_MIRROR_COMMUNITY_REPO="http://mirrors.tuna.tsinghua.edu.cn/alpine/__ALPINE_BRANCH__/community"
 '@
     $repo替换 = @'
-APK_MAIN_REPO="https://dl-cdn.alpinelinux.org/alpine/v3.21/main"
-APK_COMMUNITY_REPO="https://dl-cdn.alpinelinux.org/alpine/v3.21/community"
-APK_MIRROR_MAIN_REPO="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/main"
-APK_MIRROR_COMMUNITY_REPO="https://mirrors.tuna.tsinghua.edu.cn/alpine/v3.21/community"
+APK_MAIN_REPO="http://dl-cdn.alpinelinux.org/alpine/__ALPINE_BRANCH__/main"
+APK_COMMUNITY_REPO="http://dl-cdn.alpinelinux.org/alpine/__ALPINE_BRANCH__/community"
+APK_MIRROR_MAIN_REPO="http://mirrors.tuna.tsinghua.edu.cn/alpine/__ALPINE_BRANCH__/main"
+APK_MIRROR_COMMUNITY_REPO="http://mirrors.tuna.tsinghua.edu.cn/alpine/__ALPINE_BRANCH__/community"
 
 diag_log() {
     echo "[diag] $*"
@@ -427,6 +427,50 @@ dump_apk_lock_state() {
     ls -l /lib/apk/db/lock 2>/dev/null || echo "[diag] /lib/apk/db/lock missing"
     ps 2>/dev/null | grep -E 'apk|proot|axs|sh' | grep -v grep || true
 }
+
+dump_apk_repo_state() {
+    diag_summary "apk repo diagnostics begin"
+    diag_log "apk-arch value=$(apk --print-arch 2>/dev/null || echo unknown)"
+    dump_path_state /etc/apk/repositories
+    dump_path_state /etc/ssl
+    dump_path_state /etc/ssl/cert.pem
+    dump_path_state /etc/ssl/certs
+    dump_path_state /dev/urandom
+
+    if [ -f /etc/apk/repositories ]; then
+        sed -n '1,20p' /etc/apk/repositories 2>/dev/null | while IFS= read -r repo_line; do
+            diag_log "apk-repositories | ${repo_line}"
+        done
+    fi
+    diag_summary "apk repo diagnostics end"
+}
+
+probe_apk_repo_fetch() {
+    local arch_name
+    local repo_url
+    local index_url
+
+    arch_name="$(apk --print-arch 2>/dev/null || echo unknown)"
+    [ -f /etc/apk/repositories ] || return 0
+
+    sed -n '1,20p' /etc/apk/repositories 2>/dev/null | while IFS= read -r repo_url; do
+        [ -z "$repo_url" ] && continue
+        index_url="${repo_url}/${arch_name}/APKINDEX.tar.gz"
+        diag_log "apk-fetch-probe url=${index_url}"
+
+        if [ -x /bin/busybox ]; then
+            run_runtime_shell_probe "busybox-wget" /bin/busybox wget -S -O /dev/null "$index_url"
+        else
+            diag_log "apk-fetch-probe busybox-missing=true"
+        fi
+
+        if [ -x /usr/bin/ssl_client ]; then
+            run_runtime_shell_probe "ssl-client" /usr/bin/ssl_client -e "$index_url"
+        else
+            diag_log "apk-fetch-probe ssl_client-missing=true"
+        fi
+    done
+}
 '@
     $替换后内容 = & $执行替换 $initAlpine内容 $repo查找 $repo替换 "repo"
     if ($替换后内容 -ne $initAlpine内容) {
@@ -500,30 +544,32 @@ if [ -n "$missing_packages" ]; then
     }
 
     $updateFail查找 = @'
-        run_apk_step "apk update package-index" "$repo_mode" apk update
+        run_apk_step "apk add required-packages" "$repo_mode" apk add --no-cache $missing_packages
         if [ $? -ne 0 ]; then
-            echo -e "\e[33;1m[!] \e[0mapk update failed with ${repo_mode} repositories\e[0m"
-            continue
+            if repair_script_interpreters; then
+                run_apk_step "apk add required-packages after interpreter repair" "$repo_mode" apk add --no-cache $missing_packages
+            fi
         fi
 
-        run_apk_step "apk add required-packages" "$repo_mode" apk add $missing_packages
         if [ $? -ne 0 ]; then
             echo -e "\e[33;1m[!] \e[0mapk add failed with ${repo_mode} repositories\e[0m"
             continue
         fi
 '@
     $updateFail替换 = @'
-        run_apk_step "apk update package-index" "$repo_mode" apk update
+        run_apk_step "apk add required-packages" "$repo_mode" apk add --no-cache $missing_packages
         if [ $? -ne 0 ]; then
-            echo -e "\e[33;1m[!] \e[0mapk update failed with ${repo_mode} repositories\e[0m"
-            diag_summary "apk failure step=apk update package-index source=${repo_mode}"
-            dump_apk_lock_state
-            continue
+            if repair_script_interpreters; then
+                run_apk_step "apk add required-packages after interpreter repair" "$repo_mode" apk add --no-cache $missing_packages
+            fi
         fi
 
-        run_apk_step "apk add required-packages" "$repo_mode" apk add $missing_packages
         if [ $? -ne 0 ]; then
             echo -e "\e[33;1m[!] \e[0mapk add failed with ${repo_mode} repositories\e[0m"
+            diag_summary "apk failure step=apk add required-packages source=${repo_mode}"
+            dump_apk_lock_state
+            dump_apk_repo_state
+            probe_apk_repo_fetch
             dump_apk_failure_context "$repo_mode" "apk add required-packages" $package_list
             continue
         fi

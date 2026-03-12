@@ -94,6 +94,8 @@ $工作区根目录     = Resolve-Path (Join-Path $PSScriptRoot "..")
 $Acode源码根目录  = Join-Path $工作区根目录 "Acode"
 $Acodex根目录     = Join-Path $工作区根目录 "acodex-server"
 $HDC程序路径      = "C:\Program Files (x86)\HiSuite\hwtools\hdc.exe"
+$构建缓存目录     = Join-Path $工作区根目录 "scripts/logs/.build-cache"
+$构建缓存文件路径 = Join-Path $构建缓存目录 "state.json"
 
 function 更新Acode工作目录([string]$根目录) {
     $script:Acode根目录     = $根目录
@@ -994,6 +996,110 @@ function 获取目录文件签名([string]$目录路径) {
     return @($签名列表)
 }
 
+function 获取文件签名([string]$文件路径) {
+    if (-not (Test-Path $文件路径 -PathType Leaf)) {
+        return $null
+    }
+
+    $绝对文件路径 = (Resolve-Path $文件路径).Path
+    $相对路径 = $绝对文件路径.Substring($工作区根目录.Path.Length).TrimStart('\\').Replace('\\', '/')
+    $文件哈希 = (Get-FileHash $绝对文件路径 -Algorithm SHA256).Hash
+    return "$相对路径|$文件哈希"
+}
+
+function 获取路径签名([string[]]$路径列表) {
+    $签名列表 = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($路径 in $路径列表) {
+        if (-not (Test-Path $路径)) {
+            $签名列表.Add("missing|$路径")
+            continue
+        }
+
+        if (Test-Path $路径 -PathType Container) {
+            $目录签名 = 获取目录文件签名 $路径
+            if ($null -eq $目录签名) {
+                $签名列表.Add("missing-dir|$路径")
+                continue
+            }
+
+            foreach ($签名项 in $目录签名) {
+                $签名列表.Add("$路径|$签名项")
+            }
+            continue
+        }
+
+        $文件签名 = 获取文件签名 $路径
+        if ($null -eq $文件签名) {
+            $签名列表.Add("missing-file|$路径")
+            continue
+        }
+        $签名列表.Add($文件签名)
+    }
+
+    return @($签名列表 | Sort-Object)
+}
+
+function 获取签名摘要([string[]]$签名列表) {
+    $规范内容 = ($签名列表 | Sort-Object) -join "`n"
+    $字节数组 = [System.Text.Encoding]::UTF8.GetBytes($规范内容)
+    $哈希器 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $哈希字节 = $哈希器.ComputeHash($字节数组)
+    } finally {
+        $哈希器.Dispose()
+    }
+
+    return ([System.BitConverter]::ToString($哈希字节)).Replace('-', '')
+}
+
+function 读取构建缓存状态 {
+    if (-not (Test-Path $构建缓存文件路径 -PathType Leaf)) {
+        return @{}
+    }
+
+    $原始内容 = Get-Content $构建缓存文件路径 -Raw -Encoding UTF8
+    if ([string]::IsNullOrWhiteSpace($原始内容)) {
+        return @{}
+    }
+
+    $缓存对象 = ConvertFrom-Json $原始内容
+    if ($null -eq $缓存对象) {
+        return @{}
+    }
+
+    $缓存表 = @{}
+    foreach ($属性 in $缓存对象.PSObject.Properties) {
+        $缓存表[$属性.Name] = $属性.Value
+    }
+
+    return $缓存表
+}
+
+function 写入构建缓存状态([hashtable]$缓存状态) {
+    if (-not (Test-Path $构建缓存目录)) {
+        New-Item -ItemType Directory -Path $构建缓存目录 -Force | Out-Null
+    }
+
+    $JSON内容 = ConvertTo-Json $缓存状态 -Depth 8
+    [System.IO.File]::WriteAllText($构建缓存文件路径, $JSON内容, [System.Text.UTF8Encoding]::new($false))
+}
+
+function 获取构建缓存值([string]$键) {
+    $缓存状态 = 读取构建缓存状态
+    if ($缓存状态.ContainsKey($键)) {
+        return $缓存状态[$键]
+    }
+
+    return $null
+}
+
+function 设置构建缓存值([string]$键, $值) {
+    $缓存状态 = 读取构建缓存状态
+    $缓存状态[$键] = $值
+    写入构建缓存状态 $缓存状态
+}
+
 function 测试本地Cordova插件需要刷新($插件) {
     $源码插件目录 = $插件.路径
     $已安装插件目录 = Join-Path (Join-Path $Acode根目录 "plugins") $插件.ID
@@ -1079,6 +1185,8 @@ function 重建CordovaAndroid平台 {
     $已安装平台版本 = if ($已存在平台) { 获取已安装CordovaAndroid版本 } else { $null }
     $已刷新插件数 = 刷新本地Cordova插件
     $需要重建平台 = $强制重建平台 -or -not $已存在平台
+    $script:本地Cordova插件刷新数 = $已刷新插件数
+    $script:Android平台已重建 = $false
 
     if ($已存在平台 -and -not $已安装平台版本) {
         输出警告 "无法识别当前 Android 平台版本，改为重建平台"
@@ -1118,6 +1226,7 @@ function 重建CordovaAndroid平台 {
         exit 1
     }
 
+    $script:Android平台已重建 = $true
     输出成功 "Android 平台已按当前插件源码重建"
 }
 
@@ -1139,6 +1248,11 @@ function 设置Cordova平台 {
         输出成功 "fdroid.bool=false → targetSdkVersion=35"
 
         重建CordovaAndroid平台
+
+        if ((-not $script:Android平台已重建) -and (($script:本地Cordova插件刷新数 | ForEach-Object { $_ }) -eq 0)) {
+            输出成功 "平台与插件均未变化，跳过 Cordova prepare"
+            return
+        }
 
         Write-Host "  Cordova prepare..." -ForegroundColor DarkGray
         npx cordova prepare android 2>&1 | ForEach-Object { Write-Host "  $_" }
@@ -1200,9 +1314,28 @@ function 构建前端 {
         $前端等效Release = ($构建模式 -eq "release") -or (-not $注入调试日志)
         $配置模式  = if ($前端等效Release) { "p" } else { "d" }
         $Rspack模式 = if ($前端等效Release) { "production" } else { "development" }
+        $前端签名 = 获取签名摘要 (获取路径签名 @(
+            (Join-Path $Acode根目录 "src"),
+            (Join-Path $Acode根目录 "res"),
+            (Join-Path $Acode根目录 "utils"),
+            (Join-Path $Acode根目录 "www/index.html"),
+            (Join-Path $Acode根目录 "package.json"),
+            (Join-Path $Acode根目录 "rspack.config.js"),
+            (Join-Path $Acode根目录 "postcss.config.js"),
+            (Join-Path $Acode根目录 "tsconfig.json"),
+            (Join-Path $Acode根目录 "jsconfig.json")
+        ))
+        $前端缓存键 = "frontend|$Rspack模式|$应用类型"
+        $前端缓存值 = 获取构建缓存值 $前端缓存键
+        $前端产物标记 = Join-Path $Acode根目录 "www/build/main.js"
 
         Write-Host "  配置: mode=$配置模式 app=$应用类型" -ForegroundColor DarkGray
         输出成功 "默认不调用 utils/config.js；如需切换应用类型，需走 Acode 内置配置接口"
+
+        if (($前端缓存值 -eq $前端签名) -and (Test-Path $前端产物标记 -PathType Leaf)) {
+            输出成功 "前端输入未变化，跳过 rspack 构建"
+            return
+        }
 
         Write-Host "  rspack 构建 (mode=$Rspack模式)..." -ForegroundColor DarkGray
         npx rspack --mode $Rspack模式 2>&1 | ForEach-Object { Write-Host "  $_" }
@@ -1210,6 +1343,7 @@ function 构建前端 {
             输出错误 "rspack 构建失败"
             exit 1
         }
+        设置构建缓存值 $前端缓存键 $前端签名
         输出成功 "前端构建完成"
     } finally {
         Pop-Location
@@ -1221,6 +1355,29 @@ function 同步前端产物到平台 {
 
     Push-Location $Acode根目录
     try {
+        $同步签名 = 获取签名摘要 (获取路径签名 @(
+            (Join-Path $Acode根目录 "www"),
+            (Join-Path $Acode根目录 "config.xml"),
+            (Join-Path $Acode根目录 "src/plugins/terminal/scripts/init-sandbox.sh"),
+            (Join-Path $Acode根目录 "src/plugins/terminal/scripts/init-alpine.sh"),
+            (Join-Path $Acode根目录 "src/plugins/terminal/scripts/rm-wrapper.sh")
+        ))
+        $同步缓存键 = "platform-sync|$构建模式|$应用类型"
+        $同步缓存值 = 获取构建缓存值 $同步缓存键
+        $平台Build入口 = Join-Path $平台AssetsWww "build/main.js"
+        $平台脚本已存在 = @(
+            (Join-Path $平台Assets目录 "init-sandbox.sh"),
+            (Join-Path $平台Assets目录 "init-alpine.sh"),
+            (Join-Path $平台Assets目录 "rm-wrapper.sh")
+        ) | Where-Object { Test-Path $_ -PathType Leaf }
+
+        if (($同步缓存值 -eq $同步签名) -and
+            (Test-Path $平台Build入口 -PathType Leaf) -and
+            ($平台脚本已存在.Count -eq 3)) {
+            输出成功 "平台同步输入未变化，跳过 Cordova prepare"
+            return
+        }
+
         Write-Host "  Cordova prepare（同步最新 www/build 到 Android 平台）..." -ForegroundColor DarkGray
         npx cordova prepare android 2>&1 | ForEach-Object { Write-Host "  $_" }
         if ($LASTEXITCODE -ne 0) {
@@ -1246,6 +1403,7 @@ function 同步前端产物到平台 {
             Copy-Item $源文件 $目标文件 -Force
         }
 
+        设置构建缓存值 $同步缓存键 $同步签名
         输出成功 "已同步终端脚本到平台 assets"
         输出成功 "平台前端资源已同步为最新构建产物"
     } finally {
