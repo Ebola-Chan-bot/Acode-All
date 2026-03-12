@@ -1283,9 +1283,57 @@ function 编译AcodexServer {
             exit 1
         }
         $大小MB = [math]::Round((Get-Item $Axs二进制).Length / 1MB, 1)
+        设置构建缓存值 "acodex-server|aarch64-unknown-linux-musl|release" (获取AcodexServer源码签名)
         输出成功 "axs 编译完成 ($大小MB MB)"
     } finally {
         Pop-Location
+    }
+}
+
+function 获取AcodexServer源码签名 {
+    $签名路径列表 = @(
+        (Join-Path $Acodex根目录 "src"),
+        (Join-Path $Acodex根目录 "Cargo.toml"),
+        (Join-Path $Acodex根目录 "Cargo.lock")
+    )
+
+    return 获取签名摘要 (获取路径签名 $签名路径列表)
+}
+
+function 获取AcodexServer编译状态 {
+    $Axs二进制 = Join-Path $Acodex根目录 "target/aarch64-unknown-linux-musl/release/axs"
+    $当前签名 = 获取AcodexServer源码签名
+    $缓存键 = "acodex-server|aarch64-unknown-linux-musl|release"
+    $缓存签名 = 获取构建缓存值 $缓存键
+
+    if (-not (Test-Path $Axs二进制 -PathType Leaf)) {
+        return @{
+            需要编译 = $true
+            原因 = "未检测到 axs 编译产物"
+            当前签名 = $当前签名
+            二进制路径 = $Axs二进制
+        }
+    }
+
+    if ($缓存签名 -ne $当前签名) {
+        $原因 = if ([string]::IsNullOrWhiteSpace([string]$缓存签名)) {
+            "缺少 acodex-server 编译签名缓存"
+        } else {
+            "检测到 acodex-server 源码变更"
+        }
+
+        return @{
+            需要编译 = $true
+            原因 = $原因
+            当前签名 = $当前签名
+            二进制路径 = $Axs二进制
+        }
+    }
+
+    return @{
+        需要编译 = $false
+        当前签名 = $当前签名
+        二进制路径 = $Axs二进制
     }
 }
 
@@ -1294,14 +1342,14 @@ function 确保DebugAxs下载源可用 {
         return
     }
 
-    $Axs二进制 = Join-Path $Acodex根目录 "target/aarch64-unknown-linux-musl/release/axs"
-    if (Test-Path $Axs二进制) {
-        $大小MB = [math]::Round((Get-Item $Axs二进制).Length / 1MB, 1)
+    $编译状态 = 获取AcodexServer编译状态
+    if (-not $编译状态.需要编译) {
+        $大小MB = [math]::Round((Get-Item $编译状态.二进制路径).Length / 1MB, 1)
         输出成功 "检测到现有 axs 编译产物 ($大小MB MB)"
         return
     }
 
-    输出警告 "当前构建配置需要通过调试服务器分发 axs，未检测到编译产物，自动触发 build-server"
+    输出警告 "当前构建配置需要通过调试服务器分发 axs，$($编译状态.原因)，自动触发 build-server"
     编译AcodexServer
 }
 

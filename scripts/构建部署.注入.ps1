@@ -375,6 +375,57 @@ run_runtime_shell_probe() {
     return $exit_code
 }
 
+run_kernel_shebang_probe() {
+    local label="$1"
+    local shebang_line="$2"
+    local probe_script="/tmp/kernel-shebang-probe-${label}-$$.sh"
+
+    {
+        printf '%s\n' "$shebang_line"
+        printf '%s\n' "printf 'kernel shebang probe ${label} ok\\n'"
+    } > "$probe_script"
+
+    chmod 755 "$probe_script" 2>/dev/null || true
+    diag_log "kernel-shebang-probe label=${label} shebang=${shebang_line}"
+    run_runtime_shell_probe "kernel-shebang-${label}" "$probe_script"
+    rm -f "$probe_script"
+}
+
+dump_busybox_trigger_source() {
+    local trigger_entry=""
+
+    if [ ! -f /lib/apk/db/scripts.tar ]; then
+        diag_log "busybox-trigger scripts.tar missing"
+        return
+    fi
+
+    while IFS= read -r trigger_entry; do
+        [ -z "$trigger_entry" ] && continue
+        diag_log "busybox-trigger entry=${trigger_entry}"
+        tar -xOf /lib/apk/db/scripts.tar "$trigger_entry" 2>/dev/null | sed -n '1,80p' | while IFS= read -r trigger_line; do
+            diag_log "busybox-trigger-body entry=${trigger_entry} | ${trigger_line}"
+        done
+    done <<EOF
+$(tar -tf /lib/apk/db/scripts.tar 2>/dev/null | grep '^busybox-.*\.trigger$' || true)
+EOF
+}
+
+dump_busybox_shebang_state() {
+    diag_summary "busybox shebang diagnostics begin"
+    dump_path_state /bin/busybox
+    dump_path_state /bin/bbsuid
+    dump_path_state /bin/busybox-extras
+    dump_command_state busybox
+    dump_command_state sh
+    dump_command_state bash
+    run_runtime_shell_probe "busybox-direct-sh" /bin/busybox sh -c 'printf "busybox direct sh ok\\n"'
+    run_kernel_shebang_probe "bin-sh" '#!/bin/sh'
+    run_kernel_shebang_probe "bin-busybox-sh" '#!/bin/busybox sh'
+    run_kernel_shebang_probe "bin-bash" '#!/bin/bash'
+    dump_busybox_trigger_source
+    diag_summary "busybox shebang diagnostics end"
+}
+
 dump_runtime_shell_state() {
     diag_summary "runtime shell diagnostics begin"
     dump_env_state
@@ -404,6 +455,7 @@ dump_apk_failure_context() {
     shift 2
 
     diag_summary "apk failure step=${step_name} source=${repo_mode} requested=$*"
+    dump_busybox_shebang_state
     dump_requested_package_state "$@"
 
     local package_name
@@ -530,6 +582,12 @@ if [ -n "$missing_packages" ]; then
     diag_log "installing shell-pid=$$ ppid=$PPID missing_packages=$missing_packages"
     dump_apk_lock_state
 
+    case " $missing_packages " in
+        *" command-not-found "*)
+            dump_busybox_shebang_state
+            ;;
+    esac
+
     package_list=""
     for package_name in $missing_packages; do
         package_list="$package_list $package_name"
@@ -625,10 +683,37 @@ if [ "$#" -eq 0 ]; then
     $axsLaunch替换 = @'
 #actual source
 #everytime a terminal is started initrc will run
+cat > "$PREFIX/init-terminal-session.sh" <<'EOF'
+#!/bin/sh
+    diag_file="$PREFIX/terminal-session-wrapper.log"
+    : > "$diag_file"
+    diag_log() {
+        printf '%s\n' "$*" >> "$diag_file"
+    }
+    diag_log "[diag-summary] terminal session wrapper begin"
+    diag_log "[diag] terminal-session env PATH=${PATH} HOME=${HOME} SHELL=${SHELL} TERM=${TERM} PWD=${PWD}"
+if [ -e /initrc ]; then
+        diag_log "[diag] terminal-session path=/initrc exists=true"
+        ls -l /initrc >> "$diag_file" 2>&1 || true
+else
+        diag_log "[diag] terminal-session path=/initrc exists=false"
+fi
+if [ -x /bin/bash ]; then
+        diag_log "[diag] terminal-session path=/bin/bash executable=true"
+        ls -l /bin/bash >> "$diag_file" 2>&1 || true
+else
+        diag_log "[diag] terminal-session path=/bin/bash executable=false"
+fi
+exec bash --rcfile /initrc -i
+wrapper_exit=$?
+    diag_log "[diag-summary] terminal session wrapper exec failed exit=${wrapper_exit}"
+exit $wrapper_exit
+EOF
+chmod 755 "$PREFIX/init-terminal-session.sh"
 diag_summary "axs launch begin"
 dump_runtime_shell_state
-diag_log "axs launch command=$PREFIX/axs -c bash --rcfile /initrc -i"
-"$PREFIX/axs" -c "bash --rcfile /initrc -i"
+diag_log "axs launch command=$PREFIX/axs -c /bin/sh $PREFIX/init-terminal-session.sh"
+"$PREFIX/axs" -c "/bin/sh $PREFIX/init-terminal-session.sh"
 axs_exit=$?
 diag_summary "axs process exited exit=${axs_exit}"
 exit $axs_exit
@@ -647,10 +732,37 @@ exit $axs_exit
     $axsLaunchAllowAnyOrigin替换 = @'
 #actual source
 #everytime a terminal is started initrc will run
+cat > "$PREFIX/init-terminal-session.sh" <<'EOF'
+#!/bin/sh
+    diag_file="$PREFIX/terminal-session-wrapper.log"
+    : > "$diag_file"
+    diag_log() {
+        printf '%s\n' "$*" >> "$diag_file"
+    }
+    diag_log "[diag-summary] terminal session wrapper begin"
+    diag_log "[diag] terminal-session env PATH=${PATH} HOME=${HOME} SHELL=${SHELL} TERM=${TERM} PWD=${PWD}"
+if [ -e /initrc ]; then
+        diag_log "[diag] terminal-session path=/initrc exists=true"
+        ls -l /initrc >> "$diag_file" 2>&1 || true
+else
+        diag_log "[diag] terminal-session path=/initrc exists=false"
+fi
+if [ -x /bin/bash ]; then
+        diag_log "[diag] terminal-session path=/bin/bash executable=true"
+        ls -l /bin/bash >> "$diag_file" 2>&1 || true
+else
+        diag_log "[diag] terminal-session path=/bin/bash executable=false"
+fi
+exec bash --rcfile /initrc -i
+wrapper_exit=$?
+    diag_log "[diag-summary] terminal session wrapper exec failed exit=${wrapper_exit}"
+exit $wrapper_exit
+EOF
+chmod 755 "$PREFIX/init-terminal-session.sh"
 diag_summary "axs launch begin"
 dump_runtime_shell_state
-diag_log "axs launch command=$PREFIX/axs --allow-any-origin -c bash --rcfile /initrc -i"
-"$PREFIX/axs" --allow-any-origin -c "bash --rcfile /initrc -i"
+diag_log "axs launch command=$PREFIX/axs --allow-any-origin -c /bin/sh $PREFIX/init-terminal-session.sh"
+"$PREFIX/axs" --allow-any-origin -c "/bin/sh $PREFIX/init-terminal-session.sh"
 axs_exit=$?
 diag_summary "axs process exited exit=${axs_exit}"
 exit $axs_exit
@@ -790,6 +902,25 @@ function 重置平台终端Axs下载注入 {
     return $true
 }
 
+function 重置平台终端启动脚本注入 {
+    $终端脚本源目录 = Join-Path $Acode根目录 "src/plugins/terminal/scripts"
+    $平台InitAlpine路径 = Join-Path $平台Assets目录 "init-alpine.sh"
+    $平台InitSandbox路径 = Join-Path $平台Assets目录 "init-sandbox.sh"
+    $源InitAlpine路径 = Join-Path $终端脚本源目录 "init-alpine.sh"
+    $源InitSandbox路径 = Join-Path $终端脚本源目录 "init-sandbox.sh"
+
+    foreach ($路径 in @($源InitAlpine路径, $源InitSandbox路径, $平台InitAlpine路径, $平台InitSandbox路径)) {
+        if (-not (Test-Path $路径)) {
+            输出错误 "找不到终端启动脚本: $路径"
+            exit 1
+        }
+    }
+
+    Copy-Item $源InitAlpine路径 $平台InitAlpine路径 -Force
+    Copy-Item $源InitSandbox路径 $平台InitSandbox路径 -Force
+    return $true
+}
+
 function 设置平台终端Axs下载源 {
     param(
         [pscustomobject]$调试服务器元数据
@@ -893,6 +1024,9 @@ function 注入Debug改动 {
 
     if (重置平台终端Axs下载注入) {
         输出成功 "已恢复平台终端插件为源码基线"
+    }
+    if (重置平台终端启动脚本注入) {
+        输出成功 "已恢复平台终端启动脚本为源码基线"
     }
     if (设置平台调试Scheme -Scheme值 $null) {
         输出成功 "已清理平台产物中的调试 Scheme 注入"
