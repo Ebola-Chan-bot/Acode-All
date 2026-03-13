@@ -37,7 +37,7 @@
     AXS 下载源: default | debug-server（默认 default）
 
 .PARAMETER 注入调试日志
-    是否向构建产物注入局域网调试日志代码（默认关闭）
+    是否向构建产物注入局域网调试日志代码（默认开启，release 构建自动忽略）
 
 .EXAMPLE
   .\构建部署.ps1                               # 完整流程
@@ -48,7 +48,7 @@
   .\构建部署.ps1 -设备模式 hdc                # 使用 HDC 连接华为设备
   .\构建部署.ps1 -构建模式 release            # 构建 release 版
     .\构建部署.ps1 -动作 build-apk -Axs下载源 debug-server        # 使用调试服务器分发 AXS
-    .\构建部署.ps1 -动作 build-apk -注入调试日志                 # 注入局域网调试日志代码
+    .\构建部署.ps1 -动作 build-apk -注入调试日志:$false           # 关闭局域网调试日志注入
   .\构建部署.ps1 -动作 clean                  # 清理构建产物
 #>
 
@@ -69,7 +69,7 @@ param(
     [string]$Axs下载源 = "default",
 
     [Alias("启用调试客户端")]
-    [switch]$注入调试日志,
+    [bool]$注入调试日志 = $true,
 
     [switch]$强制重建平台,
 
@@ -84,8 +84,8 @@ if ($构建模式 -eq "release") {
         exit 1
     }
     if ($注入调试日志) {
-        输出错误 "release 构建禁止注入调试日志代码。"
-        exit 1
+        # release 构建静默忽略调试注入，不报错
+        $注入调试日志 = $false
     }
 }
 

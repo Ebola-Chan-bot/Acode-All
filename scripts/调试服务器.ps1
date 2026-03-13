@@ -429,6 +429,237 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
         if(typeof window.fetch!=="function")return false;
         if(window.fetch.__hdcWrapped)return true;
         var originalFetch=window.fetch;
+        function tryParseJson(text){
+            if(typeof text!=="string")return text;
+            try{return JSON.parse(text)}catch(e){return text}
+        }
+        function getRectSnapshot(element){
+            if(!element||typeof element.getBoundingClientRect!=="function")return null;
+            try{
+                var rect=element.getBoundingClientRect();
+                return {
+                    width:Math.round(rect.width),
+                    height:Math.round(rect.height),
+                    top:Math.round(rect.top),
+                    left:Math.round(rect.left)
+                };
+            }catch(e){
+                return null;
+            }
+        }
+        function getStyleSnapshot(element,keys){
+            if(!element||!keys||!keys.length)return null;
+            try{
+                var computed=window.getComputedStyle(element);
+                var snapshot={};
+                for(var i=0;i<keys.length;i++)snapshot[keys[i]]=computed?computed[keys[i]]:null;
+                return snapshot;
+            }catch(e){
+                return null;
+            }
+        }
+        function getCanvasSnapshot(canvas){
+            if(!canvas)return null;
+            var contextType=null;
+            try{
+                if(typeof canvas.getContext==="function"){
+                    if(canvas.getContext("webgl2"))contextType="webgl2";
+                    else if(canvas.getContext("webgl"))contextType="webgl";
+                    else if(canvas.getContext("2d"))contextType="2d";
+                }
+            }catch(e){}
+            return {
+                width:typeof canvas.width==="number"?canvas.width:null,
+                height:typeof canvas.height==="number"?canvas.height:null,
+                clientWidth:typeof canvas.clientWidth==="number"?canvas.clientWidth:null,
+                clientHeight:typeof canvas.clientHeight==="number"?canvas.clientHeight:null,
+                rect:getRectSnapshot(canvas),
+                contextType:contextType,
+                style:getStyleSnapshot(canvas,["display","visibility","opacity"])
+            };
+        }
+        function getTextSample(element,maxLength){
+            if(!element)return null;
+            try{
+                var text=String(element.textContent||"").replace(/\s+/g," ").trim();
+                if(text.length>maxLength)return text.slice(0,maxLength);
+                return text;
+            }catch(e){
+                return null;
+            }
+        }
+        function collectTerminalLayoutSnapshot(){
+            var activeTab=null;
+            try{
+                var activeTabElement=document.querySelector(".open-file-list li.active .text");
+                activeTab=activeTabElement?String(activeTabElement.textContent||"").trim():null;
+            }catch(e){}
+            var visualViewport=null;
+            try{
+                if(window.visualViewport){
+                    visualViewport={
+                        width:Math.round(window.visualViewport.width),
+                        height:Math.round(window.visualViewport.height),
+                        offsetTop:Math.round(window.visualViewport.offsetTop),
+                        offsetLeft:Math.round(window.visualViewport.offsetLeft),
+                        pageTop:Math.round(window.visualViewport.pageTop||0)
+                    };
+                }
+            }catch(e){}
+            var terminals=[];
+            try{
+                var terminalNodes=document.querySelectorAll(".terminal-content");
+                for(var i=0;i<terminalNodes.length;i++){
+                    var node=terminalNodes[i];
+                    var computed=null;
+                    try{computed=window.getComputedStyle(node)}catch(e){}
+                    var viewport=node.querySelector?node.querySelector(".xterm-viewport"):null;
+                    var xterm=node.querySelector?node.querySelector(".xterm"):null;
+                    var screen=node.querySelector?node.querySelector(".xterm-screen"):null;
+                    var rows=node.querySelector?node.querySelector(".xterm-rows"):null;
+                    var helper=node.querySelector?node.querySelector(".xterm-helpers"):null;
+                    var accessibility=node.querySelector?node.querySelector(".xterm-accessibility, .xterm-accessibility-tree"):null;
+                    var canvases=[];
+                    try{
+                        var canvasNodes=node.querySelectorAll?node.querySelectorAll(".xterm canvas"):[];
+                        for(var j=0;j<canvasNodes.length;j++)canvases.push(getCanvasSnapshot(canvasNodes[j]));
+                    }catch(e){}
+                    var rowCount=0;
+                    var nonEmptyRowCount=0;
+                    try{
+                        var rowNodes=rows&&rows.children?rows.children:[];
+                        rowCount=rowNodes.length||0;
+                        for(var k=0;k<rowNodes.length;k++){
+                            if(String(rowNodes[k].textContent||"").trim())nonEmptyRowCount++;
+                        }
+                    }catch(e){}
+                    terminals.push({
+                        index:i,
+                        id:node.id||null,
+                        className:node.className||null,
+                        connected:!!node.isConnected,
+                        hasOffsetParent:!!node.offsetParent,
+                        display:computed?computed.display:null,
+                        visibility:computed?computed.visibility:null,
+                        rect:getRectSnapshot(node),
+                        xtermRect:getRectSnapshot(xterm),
+                        xtermStyle:getStyleSnapshot(xterm,["display","visibility","opacity"]),
+                        screenRect:getRectSnapshot(screen),
+                        screenStyle:getStyleSnapshot(screen,["display","visibility","opacity"]),
+                        rowsRect:getRectSnapshot(rows),
+                        rowsStyle:getStyleSnapshot(rows,["display","visibility","opacity"]),
+                        rowCount:rowCount,
+                        nonEmptyRowCount:nonEmptyRowCount,
+                        rowTextLength:rows&&typeof rows.textContent==="string"?rows.textContent.length:null,
+                        rowTextSample:getTextSample(rows,120),
+                        helperRect:getRectSnapshot(helper),
+                        accessibilityRect:getRectSnapshot(accessibility),
+                        accessibilityTextSample:getTextSample(accessibility,120),
+                        canvasCount:canvases.length,
+                        canvases:canvases,
+                        viewportRect:getRectSnapshot(viewport),
+                        viewportScrollTop:viewport&&typeof viewport.scrollTop==="number"?viewport.scrollTop:null,
+                        viewportScrollHeight:viewport&&typeof viewport.scrollHeight==="number"?viewport.scrollHeight:null,
+                        viewportClientHeight:viewport&&typeof viewport.clientHeight==="number"?viewport.clientHeight:null
+                    });
+                }
+            }catch(e){}
+            return {
+                visibilityState:document.visibilityState||null,
+                activeTab:activeTab,
+                innerWidth:window.innerWidth,
+                innerHeight:window.innerHeight,
+                visualViewport:visualViewport,
+                terminals:terminals
+            };
+        }
+        function emitTerminalLayout(reason,extra,level){
+            send({
+                type:"console",
+                level:level||"debug",
+                args:["[terminal-layout]",reason,extra||{},collectTerminalLayoutSnapshot()],
+                timestamp:Date.now()
+            });
+        }
+        function hookTerminalLayoutDiagnostics(){
+            if(window.__hdcTerminalLayoutHooked)return;
+            window.__hdcTerminalLayoutHooked=true;
+
+            var lastActiveTab="";
+            function getActiveTabName(){
+                try{
+                    var activeTabElement=document.querySelector(".open-file-list li.active .text");
+                    return activeTabElement?String(activeTabElement.textContent||"").trim():"";
+                }catch(e){
+                    return "";
+                }
+            }
+            function emitIfActiveTabChanged(reason){
+                var activeTabName=getActiveTabName();
+                if(activeTabName===lastActiveTab)return;
+                lastActiveTab=activeTabName;
+                emitTerminalLayout(reason,{activeTab:activeTabName},"info");
+            }
+
+            emitIfActiveTabChanged("initial");
+
+            try{
+                var openFileList=document.querySelector(".open-file-list");
+                if(openFileList&&typeof MutationObserver==="function"){
+                    var observer=new MutationObserver(function(){
+                        emitIfActiveTabChanged("mutation");
+                    });
+                    observer.observe(openFileList,{subtree:true,attributes:true,attributeFilter:["class"]});
+                }
+            }catch(e){}
+
+            document.addEventListener("click",function(event){
+                var tab=event&&event.target&&event.target.closest?event.target.closest(".open-file-list li"):null;
+                if(!tab)return;
+                emitTerminalLayout("tab-click",{text:safeText(tab.textContent||"")},"info");
+                setTimeout(function(){emitIfActiveTabChanged("tab-click-post")},0);
+                setTimeout(function(){emitTerminalLayout("tab-click-settled",{text:safeText(tab.textContent||"")},"info")},80);
+            },true);
+
+            document.addEventListener("touchstart",function(event){
+                var target=event&&event.target;
+                if(!target||!target.closest)return;
+                var viewport=target.closest(".xterm-viewport");
+                if(viewport){
+                    emitTerminalLayout("viewport-touchstart",{
+                        scrollTop:typeof viewport.scrollTop==="number"?viewport.scrollTop:null,
+                        scrollHeight:typeof viewport.scrollHeight==="number"?viewport.scrollHeight:null,
+                        clientHeight:typeof viewport.clientHeight==="number"?viewport.clientHeight:null
+                    });
+                    return;
+                }
+                var terminalContent=target.closest(".terminal-content");
+                if(terminalContent){
+                    emitTerminalLayout("terminal-touchstart",{id:terminalContent.id||null});
+                }
+            },true);
+
+            document.addEventListener("scroll",function(event){
+                var target=event&&event.target;
+                if(!target||!target.classList||!target.classList.contains("xterm-viewport"))return;
+                emitTerminalLayout("viewport-scroll",{
+                    scrollTop:typeof target.scrollTop==="number"?target.scrollTop:null,
+                    scrollHeight:typeof target.scrollHeight==="number"?target.scrollHeight:null,
+                    clientHeight:typeof target.clientHeight==="number"?target.clientHeight:null
+                });
+            },true);
+
+            if(window.visualViewport&&typeof window.visualViewport.addEventListener==="function"){
+                window.visualViewport.addEventListener("resize",function(){
+                    emitTerminalLayout("visualViewport-resize",{},"info");
+                    setTimeout(function(){emitTerminalLayout("visualViewport-resize-settled",{},"info")},80);
+                },true);
+            }
+
+            document.addEventListener("visibilitychange",function(){
+                emitTerminalLayout("visibilitychange",{state:document.visibilityState||null},"info");
+            },true);
+        }
         function shouldTraceFetch(resource){
             var url="";
             try{
@@ -447,7 +678,18 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
             }catch(e){}
             var startedAt=Date.now();
             if(trace){
-                send({type:"console",level:"debug",args:["[fetch]",method,url,"begin"],timestamp:startedAt});
+                var body=null;
+                try{
+                    body=options&&typeof options.body==="string"?tryParseJson(options.body):safeText(options&&options.body);
+                }catch(e){
+                    body="[body-read-failed] "+safeText(e);
+                }
+                send({
+                    type:"console",
+                    level:"debug",
+                    args:["[fetch]",method,url,"begin",{body:body,layout:collectTerminalLayoutSnapshot()}],
+                    timestamp:startedAt
+                });
             }
             var result;
             try{
@@ -461,7 +703,12 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
             if(!result||typeof result.then!=="function")return result;
             return result.then(function(response){
                 if(trace){
-                    send({type:"console",level:"debug",args:["[fetch]",method,url,"resolved","status="+response.status,"ok="+(!!response.ok),"elapsedMs="+(Date.now()-startedAt)],timestamp:Date.now()});
+                    send({
+                        type:"console",
+                        level:"debug",
+                        args:["[fetch]",method,url,"resolved","status="+response.status,"ok="+(!!response.ok),"elapsedMs="+(Date.now()-startedAt),{layout:collectTerminalLayoutSnapshot()}],
+                        timestamp:Date.now()
+                    });
                 }
                 return response;
             }).catch(function(error){
@@ -473,6 +720,7 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
         };
         window.fetch.__hdcWrapped=true;
         send({type:"console",level:"info",args:["[fetch-api] hooked"],timestamp:Date.now()});
+        hookTerminalLayoutDiagnostics();
         return true;
     }
     function hookCordovaModuleApi(){

@@ -74,24 +74,23 @@ function 设置平台终端调试日志注入 {
     $initAlpine路径 = Join-Path $平台Assets目录 "init-alpine.sh"
     $已注入 = $false
 
-    $sandbox查找 = @'
-ARGS="$ARGS -L"
-
-$PROOT $ARGS /bin/sh $PREFIX/init-alpine.sh "$@"
-'@
-    $sandbox替换 = @'
-ARGS="$ARGS -L"
-
-echo "[sandbox] proot=$PROOT"
-echo "[sandbox] args=$ARGS"
-$PROOT $ARGS /bin/sh $PREFIX/init-alpine.sh "$@"
-PROOT_EXIT=$?
-echo "[sandbox] proot exit=$PROOT_EXIT"
-exit $PROOT_EXIT
-'@
-    if (设置平台文件文本替换 -文件路径 $initSandbox路径 -查找文本 $sandbox查找 -替换文本 $sandbox替换 -允许缺失) {
-        $已注入 = $true
+    # 使用直接字符串搜索替换，规避 CRLF/LF 跨行正则匹配的潜在不匹配问题。
+    # $PROOT 这一行在 init-sandbox.sh 中唯一出现，直接替换即可，无需多行锚点。
+    $initSandbox内容 = [IO.File]::ReadAllText($initSandbox路径)
+    $proot行 = '$PROOT $ARGS /bin/sh $PREFIX/init-alpine.sh "$@"'
+    if (-not $initSandbox内容.Contains($proot行)) {
+        输出错误 "init-sandbox.sh 缺少预期的 proot 启动行，无法注入调试诊断，请检查 init-sandbox.sh 源文件"
+        exit 1
     }
+    $proot诊断替换 = 'echo "[sandbox] proot=$PROOT"' + "`n" +
+                    'echo "[sandbox] args=$ARGS"' + "`n" +
+                    '$PROOT $ARGS /bin/sh $PREFIX/init-alpine.sh "$@"' + "`n" +
+                    'PROOT_EXIT=$?' + "`n" +
+                    'echo "[sandbox] proot exit=$PROOT_EXIT"' + "`n" +
+                    'exit $PROOT_EXIT'
+    $initSandbox内容 = $initSandbox内容.Replace($proot行, $proot诊断替换)
+    [IO.File]::WriteAllText($initSandbox路径, $initSandbox内容, [System.Text.UTF8Encoding]::new($false))
+    $已注入 = $true
 
     if (-not (Test-Path $initAlpine路径)) {
         输出错误 "找不到平台终端启动脚本: $initAlpine路径"
@@ -678,42 +677,25 @@ if [ "$#" -eq 0 ]; then
     $axsLaunch查找 = @'
 #actual source
 #everytime a terminal is started initrc will run
-"$PREFIX/axs" -c "bash --rcfile /initrc -i"
+cp -f "$PREFIX/axs" /usr/local/bin/axs
+chmod 755 /usr/local/bin/axs
+"/usr/local/bin/axs" -c "bash --rcfile /initrc -i" &
+axs_pid=$!
+wait_for_axs_ready "$axs_pid"
+wait "$axs_pid"
 '@
     $axsLaunch替换 = @'
 #actual source
 #everytime a terminal is started initrc will run
-cat > "$PREFIX/init-terminal-session.sh" <<'EOF'
-#!/bin/sh
-    diag_file="$PREFIX/terminal-session-wrapper.log"
-    : > "$diag_file"
-    diag_log() {
-        printf '%s\n' "$*" >> "$diag_file"
-    }
-    diag_log "[diag-summary] terminal session wrapper begin"
-    diag_log "[diag] terminal-session env PATH=${PATH} HOME=${HOME} SHELL=${SHELL} TERM=${TERM} PWD=${PWD}"
-if [ -e /initrc ]; then
-        diag_log "[diag] terminal-session path=/initrc exists=true"
-        ls -l /initrc >> "$diag_file" 2>&1 || true
-else
-        diag_log "[diag] terminal-session path=/initrc exists=false"
-fi
-if [ -x /bin/bash ]; then
-        diag_log "[diag] terminal-session path=/bin/bash executable=true"
-        ls -l /bin/bash >> "$diag_file" 2>&1 || true
-else
-        diag_log "[diag] terminal-session path=/bin/bash executable=false"
-fi
-exec bash --rcfile /initrc -i
-wrapper_exit=$?
-    diag_log "[diag-summary] terminal session wrapper exec failed exit=${wrapper_exit}"
-exit $wrapper_exit
-EOF
-chmod 755 "$PREFIX/init-terminal-session.sh"
 diag_summary "axs launch begin"
 dump_runtime_shell_state
-diag_log "axs launch command=$PREFIX/axs -c /bin/sh $PREFIX/init-terminal-session.sh"
-"$PREFIX/axs" -c "/bin/sh $PREFIX/init-terminal-session.sh"
+cp -f "$PREFIX/axs" /usr/local/bin/axs
+chmod 755 /usr/local/bin/axs
+diag_log "axs launch command=/usr/local/bin/axs -c bash --rcfile /initrc -i"
+"/usr/local/bin/axs" -c "bash --rcfile /initrc -i" &
+axs_pid=$!
+wait_for_axs_ready "$axs_pid"
+wait "$axs_pid"
 axs_exit=$?
 diag_summary "axs process exited exit=${axs_exit}"
 exit $axs_exit
@@ -727,42 +709,25 @@ exit $axs_exit
     $axsLaunchAllowAnyOrigin查找 = @'
 #actual source
 #everytime a terminal is started initrc will run
-"$PREFIX/axs" --allow-any-origin -c "bash --rcfile /initrc -i"
+cp -f "$PREFIX/axs" /usr/local/bin/axs
+chmod 755 /usr/local/bin/axs
+"/usr/local/bin/axs" --allow-any-origin -c "bash --rcfile /initrc -i" &
+axs_pid=$!
+wait_for_axs_ready "$axs_pid"
+wait "$axs_pid"
 '@
     $axsLaunchAllowAnyOrigin替换 = @'
 #actual source
 #everytime a terminal is started initrc will run
-cat > "$PREFIX/init-terminal-session.sh" <<'EOF'
-#!/bin/sh
-    diag_file="$PREFIX/terminal-session-wrapper.log"
-    : > "$diag_file"
-    diag_log() {
-        printf '%s\n' "$*" >> "$diag_file"
-    }
-    diag_log "[diag-summary] terminal session wrapper begin"
-    diag_log "[diag] terminal-session env PATH=${PATH} HOME=${HOME} SHELL=${SHELL} TERM=${TERM} PWD=${PWD}"
-if [ -e /initrc ]; then
-        diag_log "[diag] terminal-session path=/initrc exists=true"
-        ls -l /initrc >> "$diag_file" 2>&1 || true
-else
-        diag_log "[diag] terminal-session path=/initrc exists=false"
-fi
-if [ -x /bin/bash ]; then
-        diag_log "[diag] terminal-session path=/bin/bash executable=true"
-        ls -l /bin/bash >> "$diag_file" 2>&1 || true
-else
-        diag_log "[diag] terminal-session path=/bin/bash executable=false"
-fi
-exec bash --rcfile /initrc -i
-wrapper_exit=$?
-    diag_log "[diag-summary] terminal session wrapper exec failed exit=${wrapper_exit}"
-exit $wrapper_exit
-EOF
-chmod 755 "$PREFIX/init-terminal-session.sh"
 diag_summary "axs launch begin"
 dump_runtime_shell_state
-diag_log "axs launch command=$PREFIX/axs --allow-any-origin -c /bin/sh $PREFIX/init-terminal-session.sh"
-"$PREFIX/axs" --allow-any-origin -c "/bin/sh $PREFIX/init-terminal-session.sh"
+cp -f "$PREFIX/axs" /usr/local/bin/axs
+chmod 755 /usr/local/bin/axs
+diag_log "axs launch command=/usr/local/bin/axs --allow-any-origin -c bash --rcfile /initrc -i"
+"/usr/local/bin/axs" --allow-any-origin -c "bash --rcfile /initrc -i" &
+axs_pid=$!
+wait_for_axs_ready "$axs_pid"
+wait "$axs_pid"
 axs_exit=$?
 diag_summary "axs process exited exit=${axs_exit}"
 exit $axs_exit
@@ -1084,6 +1049,14 @@ function 注入Debug改动 {
             输出成功 "已向终端脚本注入调试日志诊断"
         } else {
             输出错误 "终端脚本调试日志注入失败：平台脚本未命中预期锚点。"
+            exit 1
+        }
+
+        $平台SandboxVerify内容 = [IO.File]::ReadAllText((Join-Path $平台Assets目录 "init-sandbox.sh"))
+        if ($平台SandboxVerify内容 -match '\[sandbox\]') {
+            输出成功 "已向终端沙盒启动脚本注入诊断日志"
+        } else {
+            输出错误 "终端沙盒脚本诊断注入失败：平台 init-sandbox.sh 未包含预期注入内容。"
             exit 1
         }
 
