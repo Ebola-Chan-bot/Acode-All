@@ -1267,12 +1267,21 @@ function 编译AcodexServer {
     输出步骤 "交叉编译 acodex-server → aarch64 musl (Alpine proot)"
 
     Push-Location $Acodex根目录
+    $终端诊断注入状态 = $null
     try {
+        $终端诊断注入状态 = 应用AcodexServer终端诊断注入 -启用:(获取AcodexServer终端诊断注入启用状态)
         Write-Host "  编译中（首次编译可能需要较长时间）..." -ForegroundColor DarkGray
         cargo zigbuild --target aarch64-unknown-linux-musl --release 2>&1 | ForEach-Object {
             if ($_ -match 'Compiling|Finished|^error|ld\.lld:|warning:') { Write-Host "  $_" }
         }
-        if ($LASTEXITCODE -ne 0) {
+        $编译退出码 = $LASTEXITCODE
+
+        if ($终端诊断注入状态) {
+            还原AcodexServer终端诊断注入 $终端诊断注入状态
+            $终端诊断注入状态 = $null
+        }
+
+        if ($编译退出码 -ne 0) {
             输出错误 "acodex-server 编译失败"
             exit 1
         }
@@ -1286,6 +1295,9 @@ function 编译AcodexServer {
         设置构建缓存值 "acodex-server|aarch64-unknown-linux-musl|release" (获取AcodexServer源码签名)
         输出成功 "axs 编译完成 ($大小MB MB)"
     } finally {
+        if ($终端诊断注入状态) {
+            还原AcodexServer终端诊断注入 $终端诊断注入状态
+        }
         Pop-Location
     }
 }
@@ -1351,6 +1363,182 @@ function 确保DebugAxs下载源可用 {
 
     输出警告 "当前构建配置需要通过调试服务器分发 axs，$($编译状态.原因)，自动触发 build-server"
     编译AcodexServer
+}
+
+function 获取AcodexServer终端诊断注入启用状态 {
+    return ($构建模式 -eq "debug") -and $注入调试日志 -and ($Axs下载源 -eq "debug-server")
+}
+
+function 应用AcodexServer终端诊断注入 {
+    param(
+        [bool]$启用
+    )
+
+    if (-not $启用) {
+        return $null
+    }
+
+    $Handlers路径 = Join-Path $Acodex根目录 "src/terminal/handlers.rs"
+    if (-not (Test-Path $Handlers路径 -PathType Leaf)) {
+        输出错误 "找不到 acodex-server 终端处理器源码: $Handlers路径"
+        exit 1
+    }
+
+    $内容 = [IO.File]::ReadAllText($Handlers路径)
+    $原内容 = $内容
+
+    $执行替换 = {
+        param(
+            [string]$当前内容,
+            [string]$查找文本,
+            [string]$替换文本,
+            [string]$标签
+        )
+
+        if (-not $当前内容.Contains($查找文本)) {
+            输出错误 "acodex-server 终端诊断注入失败，未找到锚点: $标签"
+            exit 1
+        }
+
+        $新内容 = $当前内容.Replace($查找文本, $替换文本)
+        Write-Host "  [diag-axs] ${标签}: changed=$($新内容 -ne $当前内容)" -ForegroundColor DarkGray
+        return $新内容
+    }
+
+    $内容 = & $执行替换 $内容 @'
+use regex::Regex;
+use std::io::Write;
+'@ @'
+use regex::Regex;
+use std::io::Write;
+use std::os::unix::process::ExitStatusExt;
+'@ "import-exit-status"
+
+    $内容 = & $执行替换 $内容 @'
+    if let Some(cmd) = get_default_command() {
+        let parts: Vec<String> = cmd.split_whitespace().map(|s| s.to_string()).collect();
+        if !parts.is_empty() {
+            program = parts[0].clone();
+            if parts.len() > 1 {
+                args = parts[1..].to_vec();
+            }
+        }
+    }
+
+    let size = PtySize {
+'@ @'
+    if let Some(cmd) = get_default_command() {
+        let parts: Vec<String> = cmd.split_whitespace().map(|s| s.to_string()).collect();
+        if !parts.is_empty() {
+            program = parts[0].clone();
+            if parts.len() > 1 {
+                args = parts[1..].to_vec();
+            }
+        }
+    }
+
+    tracing::info!(
+        program = %program,
+        args = ?args,
+        rows,
+        cols,
+        "Resolved terminal command"
+    );
+
+    let size = PtySize {
+'@ "resolved-command"
+
+    $内容 = & $执行替换 $内容 @'
+            match pair.slave.spawn_command(cmd) {
+                Ok(child) => Ok((pair.master, child)),
+                Err(e) => {
+'@ @'
+            match pair.slave.spawn_command(cmd) {
+                Ok(child) => {
+                    tracing::info!(
+                        program = %program,
+                        args = ?args,
+                        rows,
+                        cols,
+                        "Terminal PTY created via portable-pty"
+                    );
+                    Ok((pair.master, child))
+                }
+                Err(e) => {
+'@ "portable-pty-path"
+
+    $内容 = & $执行替换 $内容 @'
+            match fallback_open_and_spawn(size, &program, &args) {
+                Ok(pair) => pair,
+                Err(fb_err) => {
+'@ @'
+            match fallback_open_and_spawn(size, &program, &args) {
+                Ok(pair) => {
+                    tracing::info!(
+                        program = %program,
+                        args = ?args,
+                        rows,
+                        cols,
+                        "Terminal PTY created via TIOCGPTPEER fallback"
+                    );
+                    pair
+                }
+                Err(fb_err) => {
+'@ "fallback-path"
+
+    $内容 = & $执行替换 $内容 @'
+        spawn_blocking(move || {
+            let mut child_guard = child.lock().unwrap();
+            let success = match child_guard.wait() {
+                Ok(status) => status.success(),
+                Err(_) => false,
+            };
+            *exit_status.lock().unwrap() = Some(success);
+'@ @'
+        spawn_blocking(move || {
+            let mut child_guard = child.lock().unwrap();
+            let success = match child_guard.wait() {
+                Ok(status) => {
+                    tracing::info!(
+                        pid,
+                        exit_code = status.code(),
+                        signal = status.signal(),
+                        success = status.success(),
+                        "Terminal child exited"
+                    );
+                    status.success()
+                }
+                Err(error) => {
+                    tracing::error!(pid, "Failed waiting for terminal child: {}", error);
+                    false
+                }
+            };
+            *exit_status.lock().unwrap() = Some(success);
+'@ "child-exit"
+
+    if ($内容 -eq $原内容) {
+        return $null
+    }
+
+    [IO.File]::WriteAllText($Handlers路径, $内容, [System.Text.UTF8Encoding]::new($false))
+    输出成功 "已临时注入 acodex-server 终端诊断日志"
+    return [pscustomobject]@{
+        文件路径 = $Handlers路径
+        原始内容 = $原内容
+    }
+}
+
+function 还原AcodexServer终端诊断注入 {
+    param(
+        $注入状态
+    )
+
+    if (-not $注入状态) {
+        return
+    }
+
+    [IO.File]::WriteAllText($注入状态.文件路径, $注入状态.原始内容, [System.Text.UTF8Encoding]::new($false))
+    输出成功 "已还原 acodex-server 终端诊断注入"
 }
 
 # ─── 构建前端资源 ─────────────────────────────────────────────────────

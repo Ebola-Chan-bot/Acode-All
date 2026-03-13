@@ -886,6 +886,323 @@ function 重置平台终端启动脚本注入 {
     return $true
 }
 
+function 重置平台主Bundle调试注入 {
+    $源码主Bundle路径 = Join-Path $Acode根目录 "www/build/main.js"
+    $平台主Bundle路径 = Join-Path $平台AssetsWww "build/main.js"
+
+    foreach ($路径 in @($源码主Bundle路径, $平台主Bundle路径)) {
+        if (-not (Test-Path $路径)) {
+            输出错误 "找不到主 bundle 文件: $路径"
+            exit 1
+        }
+    }
+
+    Copy-Item $源码主Bundle路径 $平台主Bundle路径 -Force
+    return $true
+}
+
+function 设置平台主Bundle终端调试注入 {
+    param(
+        [bool]$启用
+    )
+
+    if (-not $启用) {
+        return $false
+    }
+
+    $平台主Bundle路径 = Join-Path $平台AssetsWww "build/main.js"
+    if (-not (Test-Path $平台主Bundle路径)) {
+        输出错误 "找不到平台主 bundle: $平台主Bundle路径"
+        exit 1
+    }
+
+    $内容 = [IO.File]::ReadAllText($平台主Bundle路径)
+    $原内容 = $内容
+
+    $执行替换 = {
+        param(
+            [string]$当前内容,
+            [string]$查找文本,
+            [string]$替换文本,
+            [string]$标签
+        )
+
+        $已匹配 = $当前内容.Contains($查找文本)
+        $新内容 = $当前内容.Replace($查找文本, $替换文本)
+        Write-Host "  [diag-bundle] ${标签}: matched=$已匹配 changed=$($新内容 -ne $当前内容)" -ForegroundColor DarkGray
+        return $新内容
+    }
+
+    $defer查找 = @'
+                                        if (shouldDeferHiddenReconnect && !terminalComponent._deferredInitializationPromise && !isActiveTerminalTab) {
+                                            return null;
+                                        }
+'@
+    $defer替换 = @'
+                                        if (shouldDeferHiddenReconnect && !terminalComponent._deferredInitializationPromise && !isActiveTerminalTab) {
+                                            window.__HDC_DEBUG_PUSH({
+                                                type: "console",
+                                                level: "info",
+                                                args: [
+                                                    "[terminal-restore]",
+                                                    "defer-hidden-reconnect",
+                                                    {
+                                                        terminalId,
+                                                        terminalName,
+                                                        pid: terminalComponent.pid || null,
+                                                        activeFileId: (activeFile === null || activeFile === void 0 ? void 0 : activeFile.id) || null,
+                                                        terminalFileId: terminalFile.id
+                                                    }
+                                                ],
+                                                timestamp: Date.now()
+                                            });
+                                            return null;
+                                        }
+'@
+    $内容 = & $执行替换 $内容 $defer查找 $defer替换 "defer"
+
+    $layoutReady查找 = '                                                    yield this.waitForTerminalLayoutReady(terminalFile, terminalComponent, terminalId);'
+    $layoutReady替换 = @'
+                                                    yield this.waitForTerminalLayoutReady(terminalFile, terminalComponent, terminalId);
+                                                    window.__HDC_DEBUG_PUSH({
+                                                        type: "console",
+                                                        level: "info",
+                                                        args: [
+                                                            "[terminal-restore]",
+                                                            "layout-ready",
+                                                            {
+                                                                terminalId,
+                                                                terminalName,
+                                                                pid: terminalOptions.pid || null,
+                                                                cols: terminalComponent.terminal ? terminalComponent.terminal.cols : null,
+                                                                rows: terminalComponent.terminal ? terminalComponent.terminal.rows : null
+                                                            }
+                                                        ],
+                                                        timestamp: Date.now()
+                                                    });
+'@
+    $内容 = & $执行替换 $内容 $layoutReady查找 $layoutReady替换 "layoutReady"
+
+    $connectResolved查找 = '                                                    yield terminalComponent.connectToSession(terminalOptions.pid);'
+    $connectResolved替换 = @'
+                                                    yield terminalComponent.connectToSession(terminalOptions.pid);
+                                                    window.__HDC_DEBUG_PUSH({
+                                                        type: "console",
+                                                        level: "info",
+                                                        args: [
+                                                            "[terminal-restore]",
+                                                            "connect-resolved",
+                                                            {
+                                                                terminalId,
+                                                                terminalName,
+                                                                pid: terminalComponent.pid || null,
+                                                                isConnected: !!terminalComponent.isConnected,
+                                                                isReconnecting
+                                                            }
+                                                        ],
+                                                        timestamp: Date.now()
+                                                    });
+'@
+    $内容 = & $执行替换 $内容 $connectResolved查找 $connectResolved替换 "connectResolved"
+
+    $ws创建查找 = @'
+            const wsUrl = `ws://localhost:${this.options.port}/terminals/${pid}`;
+            this._bootstrapOutputSeen = false;
+            this._pendingFocusAfterBootstrap = false;
+            this.websocket = new WebSocket(wsUrl);
+'@
+    $ws创建替换 = @'
+            const wsUrl = `ws://localhost:${this.options.port}/terminals/${pid}`;
+            this._bootstrapOutputSeen = false;
+            this._pendingFocusAfterBootstrap = false;
+            window.__HDC_DEBUG_PUSH({
+                type: "console",
+                level: "info",
+                args: [
+                    "[terminal-session]",
+                    "connect-begin",
+                    {
+                        name: this.terminalDisplayName || null,
+                        pid: pid || null,
+                        isReconnecting,
+                        cols: this.terminal ? this.terminal.cols : null,
+                        rows: this.terminal ? this.terminal.rows : null,
+                        containerWidth: this.container ? Math.round(this.container.getBoundingClientRect().width) : null,
+                        containerHeight: this.container ? Math.round(this.container.getBoundingClientRect().height) : null
+                    }
+                ],
+                timestamp: Date.now()
+            });
+            this.websocket = new WebSocket(wsUrl);
+            window.__HDC_DEBUG_PUSH({
+                type: "console",
+                level: "info",
+                args: [
+                    "[terminal-session]",
+                    "websocket-created",
+                    {
+                        name: this.terminalDisplayName || null,
+                        pid: pid || null,
+                        url: wsUrl,
+                        readyState: this.websocket ? this.websocket.readyState : null
+                    }
+                ],
+                timestamp: Date.now()
+            });
+'@
+    $内容 = & $执行替换 $内容 $ws创建查找 $ws创建替换 "wsCreate"
+
+    $wsOpen查找 = '                this.isConnected = true;'
+    $wsOpen替换 = @'
+                this.isConnected = true;
+                window.__HDC_DEBUG_PUSH({
+                    type: "console",
+                    level: "info",
+                    args: [
+                        "[terminal-session]",
+                        "websocket-open",
+                        {
+                            name: this.terminalDisplayName || null,
+                            pid: this.pid || null,
+                            readyState: this.websocket ? this.websocket.readyState : null
+                        }
+                    ],
+                    timestamp: Date.now()
+                });
+'@
+    $内容 = & $执行替换 $内容 $wsOpen查找 $wsOpen替换 "wsOpen"
+
+    $bootstrap查找 = @'
+        if (this._bootstrapOutputSeen) {
+            return;
+        }
+        this._bootstrapOutputSeen = true;
+'@
+    $bootstrap替换 = @'
+        if (this._bootstrapOutputSeen) {
+            return;
+        }
+        window.__HDC_DEBUG_PUSH({
+            type: "console",
+            level: "info",
+            args: [
+                "[terminal-session]",
+                "bootstrap-output-ready",
+                {
+                    name: this.terminalDisplayName || null,
+                    pid: this.pid || null,
+                    cols: this.terminal ? this.terminal.cols : null,
+                    rows: this.terminal ? this.terminal.rows : null,
+                    isConnected: !!this.isConnected
+                }
+            ],
+            timestamp: Date.now()
+        });
+        this._bootstrapOutputSeen = true;
+'@
+    $内容 = & $执行替换 $内容 $bootstrap查找 $bootstrap替换 "bootstrap"
+
+    $layout查找 = @'
+        const xtermElement = this.container.querySelector(".xterm");
+        const viewportElement = this.container.querySelector(".xterm-viewport");
+        const isViewportRelocated = xtermElement && Math.abs(xtermElement.getBoundingClientRect().top - rect.top) > 4;
+        this.fit();
+'@
+    $layout替换 = @'
+        const xtermElement = this.container.querySelector(".xterm");
+        const viewportElement = this.container.querySelector(".xterm-viewport");
+        const isViewportRelocated = xtermElement && Math.abs(xtermElement.getBoundingClientRect().top - rect.top) > 4;
+        if (isViewportRelocated || this.terminal.rows === 0) {
+            window.__HDC_DEBUG_PUSH({
+                type: "console",
+                level: isViewportRelocated ? "warn" : "info",
+                args: [
+                    "[terminal-layout-sync]",
+                    "before-fit",
+                    {
+                        name: this.terminalDisplayName || null,
+                        pid: this.pid || null,
+                        rows: this.terminal ? this.terminal.rows : null,
+                        cols: this.terminal ? this.terminal.cols : null,
+                        relocated: !!isViewportRelocated,
+                        containerTop: Math.round(rect.top),
+                        containerHeight: Math.round(rect.height),
+                        xtermTop: xtermElement ? Math.round(xtermElement.getBoundingClientRect().top) : null,
+                        xtermHeight: xtermElement ? Math.round(xtermElement.getBoundingClientRect().height) : null,
+                        viewportScrollTop: viewportElement ? viewportElement.scrollTop : null,
+                        viewportScrollHeight: viewportElement ? viewportElement.scrollHeight : null,
+                        viewportClientHeight: viewportElement ? viewportElement.clientHeight : null
+                    }
+                ],
+                timestamp: Date.now()
+            });
+        }
+        this.fit();
+'@
+    $内容 = & $执行替换 $内容 $layout查找 $layout替换 "layout"
+
+    $close查找 = @'
+            this.websocket.onclose = (event)=>{
+                var _this_onDisconnect, _this;
+                this.isConnected = false;
+                (_this_onDisconnect = (_this = this).onDisconnect) === null || _this_onDisconnect === void 0 ? void 0 : _this_onDisconnect.call(_this);
+            };
+            this.websocket.onerror = (error)=>{
+                var _this_onError, _this;
+                (_this_onError = (_this = this).onError) === null || _this_onError === void 0 ? void 0 : _this_onError.call(_this, error);
+            };
+'@
+    $close替换 = @'
+            this.websocket.onclose = (event)=>{
+                var _this_onDisconnect, _this;
+                this.isConnected = false;
+                window.__HDC_DEBUG_PUSH({
+                    type: "console",
+                    level: "warn",
+                    args: [
+                        "[terminal-session]",
+                        "websocket-close",
+                        {
+                            name: this.terminalDisplayName || null,
+                            pid: this.pid || null,
+                            code: event ? event.code : null,
+                            reason: event ? event.reason : null,
+                            wasClean: event ? event.wasClean : null
+                        }
+                    ],
+                    timestamp: Date.now()
+                });
+                (_this_onDisconnect = (_this = this).onDisconnect) === null || _this_onDisconnect === void 0 ? void 0 : _this_onDisconnect.call(_this);
+            };
+            this.websocket.onerror = (error)=>{
+                var _this_onError, _this;
+                window.__HDC_DEBUG_PUSH({
+                    type: "console",
+                    level: "error",
+                    args: [
+                        "[terminal-session]",
+                        "websocket-error",
+                        {
+                            name: this.terminalDisplayName || null,
+                            pid: this.pid || null,
+                            detail: error ? String(error.message || error.type || error) : null
+                        }
+                    ],
+                    timestamp: Date.now()
+                });
+                (_this_onError = (_this = this).onError) === null || _this_onError === void 0 ? void 0 : _this_onError.call(_this, error);
+            };
+'@
+    $内容 = & $执行替换 $内容 $close查找 $close替换 "close"
+
+    if ($内容 -eq $原内容) {
+        return $false
+    }
+
+    [IO.File]::WriteAllText($平台主Bundle路径, $内容, [System.Text.UTF8Encoding]::new($false))
+    return $true
+}
+
 function 设置平台终端Axs下载源 {
     param(
         [pscustomobject]$调试服务器元数据
@@ -993,6 +1310,9 @@ function 注入Debug改动 {
     if (重置平台终端启动脚本注入) {
         输出成功 "已恢复平台终端启动脚本为源码基线"
     }
+    if (重置平台主Bundle调试注入) {
+        输出成功 "已恢复平台主 bundle 为源码基线"
+    }
     if (设置平台调试Scheme -Scheme值 $null) {
         输出成功 "已清理平台产物中的调试 Scheme 注入"
     }
@@ -1058,6 +1378,17 @@ function 注入Debug改动 {
         } else {
             输出错误 "终端沙盒脚本诊断注入失败：平台 init-sandbox.sh 未包含预期注入内容。"
             exit 1
+        }
+
+        if (设置平台主Bundle终端调试注入 -启用 $true) {
+            $平台主Bundle路径 = Join-Path $平台AssetsWww "build/main.js"
+            $平台主Bundle内容 = Get-Content $平台主Bundle路径 -Raw -Encoding UTF8
+            if ($平台主Bundle内容 -match '\[terminal-session\]' -and $平台主Bundle内容 -match '\[terminal-restore\]') {
+                输出成功 "已向主 bundle 注入终端恢复/连接诊断日志"
+            } else {
+                输出错误 "主 bundle 终端诊断注入失败：平台 main.js 未包含预期注入内容。"
+                exit 1
+            }
         }
 
         $平台IndexHtml = Join-Path $平台AssetsWww "index.html"
