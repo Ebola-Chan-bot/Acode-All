@@ -9,7 +9,7 @@
     3. 安装 Node.js 依赖并设置 Cordova 平台
     4. 按需交叉编译 acodex-server（供 release 发布或调试服务器分发）
     5. 构建前端资源（rspack）+ 同步到平台目录
-    6. 按开关对平台产物动态注入调试日志代码与 AXS 下载源
+    6. 按开关应用调试构建改动与 AXS 下载源
     7. 通过 ADB 或 HDC 安装到手机
 
 .PARAMETER 动作
@@ -37,7 +37,7 @@
     AXS 下载源: default | debug-server（默认 default）
 
 .PARAMETER 注入调试日志
-    是否向构建产物注入局域网调试日志代码（默认开启，release 构建自动忽略）
+    是否向构建产物接入局域网调试客户端（默认开启，release 构建自动忽略）
 
 .EXAMPLE
   .\构建部署.ps1                               # 完整流程
@@ -47,8 +47,8 @@
   .\构建部署.ps1 -动作 deploy                 # 仅推送 APK
   .\构建部署.ps1 -设备模式 hdc                # 使用 HDC 连接华为设备
   .\构建部署.ps1 -构建模式 release            # 构建 release 版
-    .\构建部署.ps1 -动作 build-apk -Axs下载源 debug-server        # 使用调试服务器分发 AXS
-    .\构建部署.ps1 -动作 build-apk -注入调试日志:$false           # 关闭局域网调试日志注入
+  .\构建部署.ps1 -动作 build-apk -Axs下载源 debug-server        # 使用调试服务器分发 AXS
+  .\构建部署.ps1 -动作 build-apk -注入调试日志:$false           # 关闭局域网调试客户端
   .\构建部署.ps1 -动作 clean                  # 清理构建产物
 #>
 
@@ -84,7 +84,7 @@ if ($构建模式 -eq "release") {
         exit 1
     }
     if ($注入调试日志) {
-        # release 构建静默忽略调试注入，不报错
+        # release 构建静默忽略调试客户端接入，避免发布包携带调试入口。
         $注入调试日志 = $false
     }
 }
@@ -124,7 +124,310 @@ function 检查命令($命令, $提示) {
     }
 }
 
-. (Join-Path $PSScriptRoot "构建部署.注入.ps1")
+# 不再依赖外部“构建部署.注入”脚本，避免隐藏构建期改写逻辑。调试相关平台改动统一保留在主脚本内。
+function 获取调试客户端脚本片段 {
+    param(
+        [pscustomobject]$调试服务器元数据,
+        [string]$调试构建标识
+    )
+
+    return @(
+        "    <!-- HDC_DEBUG --><script>window.__HDC_DEBUG_BUILD_ID = '$调试构建标识'; window.__HDC_DEBUG_SCRIPT_URL = '$($调试服务器元数据.scriptUrl)';</script>",
+        '    <!-- HDC_DEBUG --><script src="' + $调试服务器元数据.scriptUrl + '"></script>'
+    ) -join "`n"
+}
+
+function 测试调试服务器可达 {
+    param(
+        [string]$主机,
+        [int]$端口,
+        [int]$超时毫秒 = 2000
+    )
+
+    try {
+        $客户端 = [System.Net.Sockets.TcpClient]::new()
+        $异步结果 = $客户端.BeginConnect($主机, $端口, $null, $null)
+        if (-not $异步结果.AsyncWaitHandle.WaitOne($超时毫秒, $false)) {
+            $客户端.Dispose()
+            return $false
+        }
+        $客户端.EndConnect($异步结果)
+        $客户端.Dispose()
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function 获取调试服务器TLS元数据 {
+    $元数据路径 = Join-Path $工作区根目录 "scripts/logs/调试服务器-metadata.json"
+    if (-not (Test-Path $元数据路径)) {
+        return $null
+    }
+
+    try {
+        return Get-Content $元数据路径 -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        输出错误 "调试服务器元数据解析失败: $元数据路径"
+        exit 1
+    }
+}
+
+function 获取调试服务器Axs下载地址 {
+    param(
+        [pscustomobject]$调试服务器元数据
+    )
+
+    return [ordered]@{
+        arm64 = $调试服务器元数据.axsUrls.arm64
+        armv7 = $调试服务器元数据.axsUrls.armv7
+        x64 = $调试服务器元数据.axsUrls.x64
+    }
+}
+
+function 重置平台终端Axs下载改动 {
+    $平台基线终端脚本 = Join-Path $平台根目录 "platform_www/plugins/com.foxdebug.acode.rk.exec.terminal/www/Terminal.js"
+    $平台终端脚本 = Join-Path $平台AssetsWww "plugins/com.foxdebug.acode.rk.exec.terminal/www/Terminal.js"
+
+    foreach ($路径 in @($平台基线终端脚本, $平台终端脚本)) {
+        if (-not (Test-Path $路径 -PathType Leaf)) {
+            输出错误 "找不到平台终端插件脚本: $路径"
+            exit 1
+        }
+    }
+
+    $平台基线内容 = Get-Content $平台基线终端脚本 -Raw -Encoding UTF8
+    if ($平台基线内容 -notmatch '^cordova\.define\("com\.foxdebug\.acode\.rk\.exec\.terminal\.Terminal"') {
+        输出错误 "平台终端插件基线不是 Cordova 模块包装版本: $平台基线终端脚本"
+        exit 1
+    }
+
+    Copy-Item $平台基线终端脚本 $平台终端脚本 -Force
+    return $true
+}
+
+function 重置平台终端启动脚本改动 {
+    $终端脚本源目录 = Join-Path $Acode根目录 "src/plugins/terminal/scripts"
+    $平台InitAlpine路径 = Join-Path $平台Assets目录 "init-alpine.sh"
+    $平台InitSandbox路径 = Join-Path $平台Assets目录 "init-sandbox.sh"
+    $源InitAlpine路径 = Join-Path $终端脚本源目录 "init-alpine.sh"
+    $源InitSandbox路径 = Join-Path $终端脚本源目录 "init-sandbox.sh"
+
+    foreach ($路径 in @($源InitAlpine路径, $源InitSandbox路径, $平台InitAlpine路径, $平台InitSandbox路径)) {
+        if (-not (Test-Path $路径 -PathType Leaf)) {
+            输出错误 "找不到终端启动脚本: $路径"
+            exit 1
+        }
+    }
+
+    Copy-Item $源InitAlpine路径 $平台InitAlpine路径 -Force
+    Copy-Item $源InitSandbox路径 $平台InitSandbox路径 -Force
+    return $true
+}
+
+function 重置平台主Bundle调试改动 {
+    $源码主Bundle路径 = Join-Path $Acode根目录 "www/build/main.js"
+    $平台主Bundle路径 = Join-Path $平台AssetsWww "build/main.js"
+
+    foreach ($路径 in @($源码主Bundle路径, $平台主Bundle路径)) {
+        if (-not (Test-Path $路径 -PathType Leaf)) {
+            输出错误 "找不到主 bundle 文件: $路径"
+            exit 1
+        }
+    }
+
+    Copy-Item $源码主Bundle路径 $平台主Bundle路径 -Force
+    return $true
+}
+
+function 设置平台终端Axs下载源 {
+    param(
+        [pscustomobject]$调试服务器元数据
+    )
+
+    $平台终端脚本 = Join-Path $平台AssetsWww "plugins/com.foxdebug.acode.rk.exec.terminal/www/Terminal.js"
+    if (-not (Test-Path $平台终端脚本 -PathType Leaf)) {
+        输出错误 "找不到平台终端插件脚本: $平台终端脚本"
+        exit 1
+    }
+
+    $下载地址 = 获取调试服务器Axs下载地址 -调试服务器元数据 $调试服务器元数据
+    $内容 = Get-Content $平台终端脚本 -Raw -Encoding UTF8
+    $原内容 = $内容
+
+    $替换映射 = [ordered]@{
+        'https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-arm64' = $下载地址.arm64
+        'https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-armv7' = $下载地址.armv7
+        'https://github.com/bajrangCoder/acodex_server/releases/latest/download/axs-musl-android-x86_64' = $下载地址.x64
+    }
+
+    foreach ($原地址 in $替换映射.Keys) {
+        if (-not $内容.Contains($原地址)) {
+            输出错误 "平台终端脚本缺少预期的 AXS 下载地址: $原地址"
+            exit 1
+        }
+        $内容 = $内容.Replace($原地址, $替换映射[$原地址])
+    }
+
+    if ($内容 -eq $原内容) {
+        return $false
+    }
+
+    [System.IO.File]::WriteAllText($平台终端脚本, $内容, [System.Text.UTF8Encoding]::new($false))
+    return $true
+}
+
+function 清理平台调试客户端改动 {
+    $平台IndexHtml = Join-Path $平台AssetsWww "index.html"
+    if (-not (Test-Path $平台IndexHtml -PathType Leaf)) {
+        输出错误 "找不到平台 index.html: $平台IndexHtml"
+        exit 1
+    }
+
+    $内容 = Get-Content $平台IndexHtml -Raw -Encoding UTF8
+    $原内容 = $内容
+    $内容 = $内容 -replace '(?m)^\s*<!-- HDC_DEBUG -->.*\r?\n?', ''
+
+    if ($内容 -eq $原内容) {
+        return $false
+    }
+
+    [System.IO.File]::WriteAllText($平台IndexHtml, $内容, [System.Text.UTF8Encoding]::new($false))
+    return $true
+}
+
+function 清理平台调试证书信任 {
+    $调试资源根目录 = Join-Path $平台根目录 "app/src/debug/res"
+    $调试证书路径 = Join-Path $调试资源根目录 "raw/acode_debug_server_cert.cer"
+    $调试配置路径 = Join-Path $调试资源根目录 "xml/network_security_config.xml"
+    $已清理 = $false
+
+    if (Test-Path $调试证书路径) {
+        Remove-Item $调试证书路径 -Force
+        $已清理 = $true
+    }
+    if (Test-Path $调试配置路径) {
+        Remove-Item $调试配置路径 -Force
+        $已清理 = $true
+    }
+
+    return $已清理
+}
+
+function 设置平台调试证书信任 {
+    param(
+        [pscustomobject]$调试服务器元数据
+    )
+
+    $主配置路径 = Join-Path $平台根目录 "app/src/main/res/xml/network_security_config.xml"
+    if (-not (Test-Path $主配置路径 -PathType Leaf)) {
+        输出错误 "找不到平台主网络安全配置: $主配置路径"
+        exit 1
+    }
+
+    $调试资源根目录 = Join-Path $平台根目录 "app/src/debug/res"
+    $调试Raw目录 = Join-Path $调试资源根目录 "raw"
+    $调试Xml目录 = Join-Path $调试资源根目录 "xml"
+    $调试证书路径 = Join-Path $调试Raw目录 "acode_debug_server_cert.cer"
+    $调试配置路径 = Join-Path $调试Xml目录 "network_security_config.xml"
+
+    New-Item -ItemType Directory -Path $调试Raw目录 -Force | Out-Null
+    New-Item -ItemType Directory -Path $调试Xml目录 -Force | Out-Null
+
+    Copy-Item $调试服务器元数据.certificatePath $调试证书路径 -Force
+
+    $配置内容 = Get-Content $主配置路径 -Raw -Encoding UTF8
+    $配置内容 = $配置内容 -replace '\s*<certificates src="@raw/acode_debug_server_cert"\s*/>\s*', "`n"
+
+    if ($配置内容 -match '<certificates src="system"\s*/>') {
+        $配置内容 = $配置内容 -replace '<certificates src="system"\s*/>', "<certificates src=""system"" />`n      <certificates src=""@raw/acode_debug_server_cert"" />"
+    } elseif ($配置内容 -match '<trust-anchors>') {
+        $配置内容 = $配置内容 -replace '<trust-anchors>', "<trust-anchors>`n      <certificates src=""@raw/acode_debug_server_cert"" />"
+    } else {
+        输出错误 "平台网络安全配置缺少 trust-anchors，无法写入调试证书。"
+        exit 1
+    }
+
+    [System.IO.File]::WriteAllText($调试配置路径, $配置内容, [System.Text.UTF8Encoding]::new($false))
+    return $true
+}
+
+function 应用调试构建改动 {
+    if (-not (Test-Path $平台Assets目录)) {
+        输出错误 "平台 assets 目录不存在，请先运行: .\构建部署.ps1 -动作 setup"
+        exit 1
+    }
+
+    $需要调试服务器 = ($Axs下载源 -eq "debug-server") -or $注入调试日志
+
+    if (重置平台终端Axs下载改动) {
+        输出成功 "已恢复平台终端插件为源码基线"
+    }
+    if (重置平台终端启动脚本改动) {
+        输出成功 "已恢复平台终端启动脚本为源码基线"
+    }
+    if (重置平台主Bundle调试改动) {
+        输出成功 "已恢复平台主 bundle 为源码基线"
+    }
+    $已清理调试客户端 = 清理平台调试客户端改动
+    if (清理平台调试证书信任) {
+        输出成功 "已清理平台产物中的调试证书信任"
+    }
+
+    if (-not $需要调试服务器) {
+        if ($已清理调试客户端) {
+            输出成功 "已清理平台产物中的旧调试客户端脚本"
+        }
+        输出成功 "当前构建不需要额外调试构建改动"
+        return
+    }
+
+    输出步骤 "应用调试构建改动"
+
+    $调试服务器元数据 = 获取调试服务器TLS元数据
+    if (-not $调试服务器元数据) {
+        输出错误 "当前构建配置需要调试服务器，但找不到调试服务器元数据。"
+        输出错误 "请先启动 scripts/调试服务器.ps1，再重新构建。"
+        exit 1
+    }
+
+    if (-not (测试调试服务器可达 -主机 $调试服务器元数据.host -端口 ([int]$调试服务器元数据.port))) {
+        输出错误 "当前构建配置需要调试服务器，但调试服务器不可达: $($调试服务器元数据.host):$($调试服务器元数据.port)"
+        输出错误 "请先启动 scripts/调试服务器.ps1，再重新构建。"
+        exit 1
+    }
+
+    if ($Axs下载源 -eq "debug-server") {
+        if (设置平台终端Axs下载源 -调试服务器元数据 $调试服务器元数据) {
+            $下载地址 = 获取调试服务器Axs下载地址 -调试服务器元数据 $调试服务器元数据
+            输出成功 "已将 AXS 下载源切换为调试服务器"
+            输出成功 "AXS 下载地址: $($下载地址.arm64)"
+        }
+    } else {
+        输出成功 "AXS 下载源保持默认 release 地址"
+    }
+
+    if (设置平台调试证书信任 -调试服务器元数据 $调试服务器元数据) {
+        输出成功 "已写入调试服务器证书信任"
+    }
+
+    if ($注入调试日志) {
+        $平台IndexHtml = Join-Path $平台AssetsWww "index.html"
+        $调试构建标识 = (Get-Date).ToString("yyyyMMdd-HHmmss")
+        $内容 = Get-Content $平台IndexHtml -Raw -Encoding UTF8
+        $调试脚本标签 = 获取调试客户端脚本片段 -调试服务器元数据 $调试服务器元数据 -调试构建标识 $调试构建标识
+        if ($内容 -notmatch '<script src="cordova\.js"></script>') {
+            输出错误 "平台 index.html 缺少 cordova.js 脚本标签，无法写入调试客户端。"
+            exit 1
+        }
+        $内容 = $内容 -replace '(\s*<script src="cordova\.js"></script>)', "`n$调试脚本标签`n`$1"
+        [System.IO.File]::WriteAllText($平台IndexHtml, $内容, [System.Text.UTF8Encoding]::new($false))
+
+        输出成功 "调试服务器地址: $($调试服务器元数据.scriptUrl)"
+        输出成功 "调试构建标识: $调试构建标识"
+        输出成功 "已写入调试客户端到平台 index.html"
+    }
+}
 
 function 获取应用信息 {
     if (-not (Test-Path $配置XML路径)) {
@@ -1366,7 +1669,8 @@ function 确保DebugAxs下载源可用 {
 }
 
 function 获取AcodexServer终端诊断注入启用状态 {
-    return ($构建模式 -eq "debug") -and $注入调试日志 -and ($Axs下载源 -eq "debug-server")
+    # 旧版通过脚本动态改写 Rust 源码插诊断，已经证明会引入脆弱锚点并污染构建流程；现在统一改为源码内调试日志。 
+    return $false
 }
 
 function 应用AcodexServer终端诊断注入 {
@@ -1374,158 +1678,8 @@ function 应用AcodexServer终端诊断注入 {
         [bool]$启用
     )
 
-    if (-not $启用) {
-        return $null
-    }
-
-    $Handlers路径 = Join-Path $Acodex根目录 "src/terminal/handlers.rs"
-    if (-not (Test-Path $Handlers路径 -PathType Leaf)) {
-        输出错误 "找不到 acodex-server 终端处理器源码: $Handlers路径"
-        exit 1
-    }
-
-    $内容 = [IO.File]::ReadAllText($Handlers路径)
-    $原内容 = $内容
-
-    $执行替换 = {
-        param(
-            [string]$当前内容,
-            [string]$查找文本,
-            [string]$替换文本,
-            [string]$标签
-        )
-
-        if (-not $当前内容.Contains($查找文本)) {
-            输出错误 "acodex-server 终端诊断注入失败，未找到锚点: $标签"
-            exit 1
-        }
-
-        $新内容 = $当前内容.Replace($查找文本, $替换文本)
-        Write-Host "  [diag-axs] ${标签}: changed=$($新内容 -ne $当前内容)" -ForegroundColor DarkGray
-        return $新内容
-    }
-
-    $内容 = & $执行替换 $内容 @'
-use regex::Regex;
-use std::io::Write;
-'@ @'
-use regex::Regex;
-use std::io::Write;
-use std::os::unix::process::ExitStatusExt;
-'@ "import-exit-status"
-
-    $内容 = & $执行替换 $内容 @'
-    if let Some(cmd) = get_default_command() {
-        let parts: Vec<String> = cmd.split_whitespace().map(|s| s.to_string()).collect();
-        if !parts.is_empty() {
-            program = parts[0].clone();
-            if parts.len() > 1 {
-                args = parts[1..].to_vec();
-            }
-        }
-    }
-
-    let size = PtySize {
-'@ @'
-    if let Some(cmd) = get_default_command() {
-        let parts: Vec<String> = cmd.split_whitespace().map(|s| s.to_string()).collect();
-        if !parts.is_empty() {
-            program = parts[0].clone();
-            if parts.len() > 1 {
-                args = parts[1..].to_vec();
-            }
-        }
-    }
-
-    tracing::info!(
-        program = %program,
-        args = ?args,
-        rows,
-        cols,
-        "Resolved terminal command"
-    );
-
-    let size = PtySize {
-'@ "resolved-command"
-
-    $内容 = & $执行替换 $内容 @'
-            match pair.slave.spawn_command(cmd) {
-                Ok(child) => Ok((pair.master, child)),
-                Err(e) => {
-'@ @'
-            match pair.slave.spawn_command(cmd) {
-                Ok(child) => {
-                    tracing::info!(
-                        program = %program,
-                        args = ?args,
-                        rows,
-                        cols,
-                        "Terminal PTY created via portable-pty"
-                    );
-                    Ok((pair.master, child))
-                }
-                Err(e) => {
-'@ "portable-pty-path"
-
-    $内容 = & $执行替换 $内容 @'
-            match fallback_open_and_spawn(size, &program, &args) {
-                Ok(pair) => pair,
-                Err(fb_err) => {
-'@ @'
-            match fallback_open_and_spawn(size, &program, &args) {
-                Ok(pair) => {
-                    tracing::info!(
-                        program = %program,
-                        args = ?args,
-                        rows,
-                        cols,
-                        "Terminal PTY created via TIOCGPTPEER fallback"
-                    );
-                    pair
-                }
-                Err(fb_err) => {
-'@ "fallback-path"
-
-    $内容 = & $执行替换 $内容 @'
-        spawn_blocking(move || {
-            let mut child_guard = child.lock().unwrap();
-            let success = match child_guard.wait() {
-                Ok(status) => status.success(),
-                Err(_) => false,
-            };
-            *exit_status.lock().unwrap() = Some(success);
-'@ @'
-        spawn_blocking(move || {
-            let mut child_guard = child.lock().unwrap();
-            let success = match child_guard.wait() {
-                Ok(status) => {
-                    tracing::info!(
-                        pid,
-                        exit_code = status.code(),
-                        signal = status.signal(),
-                        success = status.success(),
-                        "Terminal child exited"
-                    );
-                    status.success()
-                }
-                Err(error) => {
-                    tracing::error!(pid, "Failed waiting for terminal child: {}", error);
-                    false
-                }
-            };
-            *exit_status.lock().unwrap() = Some(success);
-'@ "child-exit"
-
-    if ($内容 -eq $原内容) {
-        return $null
-    }
-
-    [IO.File]::WriteAllText($Handlers路径, $内容, [System.Text.UTF8Encoding]::new($false))
-    输出成功 "已临时注入 acodex-server 终端诊断日志"
-    return [pscustomobject]@{
-        文件路径 = $Handlers路径
-        原始内容 = $原内容
-    }
+    # 保留接口仅为了兼容现有构建流程调用点，但不再允许构建期动态改写源码，防止锚点漂移导致脚本失效。
+    return $null
 }
 
 function 还原AcodexServer终端诊断注入 {
@@ -1533,12 +1687,8 @@ function 还原AcodexServer终端诊断注入 {
         $注入状态
     )
 
-    if (-not $注入状态) {
-        return
-    }
-
-    [IO.File]::WriteAllText($注入状态.文件路径, $注入状态.原始内容, [System.Text.UTF8Encoding]::new($false))
-    输出成功 "已还原 acodex-server 终端诊断注入"
+    # 与上面的 no-op 成对保留，避免旧调用点继续尝试回滚不存在的动态注入状态。
+    return
 }
 
 # ─── 构建前端资源 ─────────────────────────────────────────────────────
@@ -1870,7 +2020,7 @@ switch ($动作) {
         确保DebugAxs下载源可用
         构建前端
         同步前端产物到平台
-        注入Debug改动
+        应用调试构建改动
         构建APK
         验证源码未被修改
     }
@@ -1895,7 +2045,7 @@ switch ($动作) {
         }
         构建前端
         同步前端产物到平台
-        注入Debug改动
+        应用调试构建改动
         $APK文件 = 构建APK
         验证源码未被修改
         部署APK -APK路径 $APK文件
