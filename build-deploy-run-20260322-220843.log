@@ -1,0 +1,239 @@
+
+╔══════════════════════════════════════════════╗
+║  Acode + acodex-server 一键构建部署工具     ║
+╚══════════════════════════════════════════════╝
+  工作区: C:\Users\vhtmf\source\repos\Acode-All
+  动作: full | 构建: debug | 应用: paid | 设备: adb
+
+▶ 检测构建环境
+  ✓ Git: git version 2.51.0.windows.1
+  ✓ Node.js: v24.11.1
+  ✓ npm: 11.6.2
+  ✓ JAVA_HOME: C:\Program Files\Android\openjdk\jdk-21.0.8
+  ✓ ANDROID_HOME: C:\Program Files (x86)\Android\android-sdk
+  ✓ Android Build Tools 最新版: 36.0.0
+  ✓ Gradle: 
+  ✓ Rust: rustc 1.93.1 (01f6ddf75 2026-02-11)
+  ✓ zig: 0.15.2
+  ✓ cargo-zigbuild: cargo-zigbuild 0.22.1
+  ✓ Rust musl target: aarch64-unknown-linux-musl
+
+▶ 初始化 Git 子模块（竞速克隆）
+  ✓ 子模块已就绪，跳过克隆
+  ✓ 子模块已就绪
+
+▶ 安装 Node.js 依赖
+  
+  up to date, audited 974 packages in 10s
+  
+  145 packages are looking for funding
+    run `npm fund` for details
+  
+  13 vulnerabilities (8 moderate, 5 high)
+  
+  To address issues that do not require attention, run:
+    npm audit fix
+  
+  To address all issues (including breaking changes), run:
+    npm audit fix --force
+  
+  Run `npm audit` for details.
+  ✓ 依赖安装完成
+  ✓ 已记录构建前的 Acode git 状态基线
+
+▶ 设置 Cordova Android 平台
+  ✓ fdroid.bool=false → targetSdkVersion=35
+
+▶ 检查本地 Cordova 插件是否需要刷新
+  跳过插件: com.foxdebug.acode.rk.auth（源码与已安装副本一致）
+  跳过插件: com.foxdebug.acode.rk.customtabs（源码与已安装副本一致）
+  跳过插件: com.foxdebug.acode.rk.exec.proot（源码与已安装副本一致）
+  跳过插件: com.foxdebug.acode.rk.exec.terminal（源码与已安装副本一致）
+  跳过插件: com.foxdebug.acode.rk.plugin.plugincontext（源码与已安装副本一致）
+  跳过插件: cordova-plugin-browser（源码与已安装副本一致）
+  跳过插件: cordova-plugin-buildinfo（源码与已安装副本一致）
+  跳过插件: cordova-plugin-ftp（源码与已安装副本一致）
+  跳过插件: cordova-plugin-iap（源码与已安装副本一致）
+  跳过插件: cordova-plugin-sdcard（源码与已安装副本一致）
+  跳过插件: cordova-plugin-server（源码与已安装副本一致）
+  跳过插件: cordova-plugin-sftp（源码与已安装副本一致）
+  跳过插件: cordova-plugin-system（源码与已安装副本一致）
+  跳过插件: cordova-plugin-websocket（源码与已安装副本一致）
+  ✓ 本地 Cordova 插件均与 src/plugins 源码一致，已跳过刷新
+  ✓ 已复用现有 Android 平台，无需重新 add platform
+  ✓ 平台与插件均未变化，跳过 Cordova prepare
+
+▶ 构建前端资源
+  配置: mode=d app=paid
+  ✓ 默认不调用 utils/config.js；如需切换应用类型，需走 Acode 内置配置接口
+  rspack 构建 (mode=development)...
+  Rspack compiled successfully in 9.48 s
+  ✓ 前端构建完成
+
+▶ 同步前端产物到平台
+  Cordova prepare（同步最新 www/build 到 Android 平台）...
+  
+  ===================================================
+  ==== Changed provider to com.foxdebug.provider ====
+  ===================================================
+  
+  skipped: anim
+  deleted: ic_cdv_splashscreen.xml
+  deleted: ic_launcher_background.xml
+  deleted: ic_launcher_foreground.xml
+  deleted: drawable
+  deleted: ic_launcher.xml
+  deleted: ic_launcher_round.xml
+  deleted: mipmap-anydpi-v26
+  deleted: ic_launcher.webp
+  deleted: ic_launcher_round.webp
+  deleted: mipmap-hdpi
+  deleted: ic_launcher.webp
+  deleted: ic_launcher_round.webp
+  deleted: mipmap-mdpi
+  deleted: ic_launcher.webp
+  deleted: ic_launcher_round.webp
+  deleted: mipmap-xhdpi
+  deleted: ic_launcher.webp
+  deleted: ic_launcher_round.webp
+  deleted: mipmap-xxhdpi
+  deleted: ic_launcher.webp
+  deleted: ic_launcher_round.webp
+  deleted: mipmap-xxxhdpi
+  skipped: values\colors.xml
+  deleted: ic_launcher_background.xml
+  skipped: values\strings.xml
+  skipped: values\styles.xml
+  skipped: values\themes.xml
+  skipped: xml
+  copied: ic_launcher_background.xml
+  copied: ic_launcher_foreground.xml
+  copied: ic_launcher.xml
+  copied: ic_launcher_round.xml
+  copied: ic_launcher.webp
+  copied: ic_launcher_round.webp
+  copied: ic_launcher.webp
+  copied: ic_launcher_round.webp
+  copied: ic_launcher.webp
+  copied: ic_launcher_round.webp
+  copied: ic_launcher.webp
+  copied: ic_launcher_round.webp
+  copied: ic_launcher.webp
+  copied: ic_launcher_round.webp
+  copied: colors.xml
+  copied: ic_launcher_background.xml
+  copied: themes.xml
+  copied: network_security_config.xml
+  [Cordova Hook] ✅ Patched targetSdkVersion to 35
+  
+  ===============================================
+  ==== Changed package to com.foxdebug.acode ====
+  ===============================================
+  
+  
+  =========================================================
+  ==== Changed provider to com.foxdebug.acode.provider ====
+  =========================================================
+  
+  ✓ 已同步终端脚本到平台 assets
+  ✓ 平台前端资源已同步为最新构建产物
+  ✓ 已恢复平台终端插件为源码基线
+  ✓ 已恢复平台终端启动脚本为源码基线
+  ✓ 已恢复平台主 bundle 为源码基线
+  ✓ 已清理平台产物中的调试证书信任
+
+▶ 应用调试构建改动
+  ✓ AXS 下载源保持默认 release 地址
+  ✓ 已写入调试服务器证书信任
+  ✓ 调试服务器地址: https://10.20.217.181:8092/__debug_client.js
+  ✓ 调试构建标识: 20260322-220942
+  ✓ 已写入调试客户端到平台 index.html
+
+▶ Gradle 构建 APK
+  ✓ 使用运行时 Build Tools 版本: 36.0.0
+  ✓ 使用本机 Gradle: C:\Users\vhtmf\.gradle\wrapper\dists\gradle-8.9-bin\90cnw93cvbtalezasaz0blq0a\gradle-8.9\bin\gradle.bat
+  > Task :app:preBuild UP-TO-DATE
+  > Task :app:preDebugBuild UP-TO-DATE
+  > Task :app:mergeDebugNativeDebugMetadata NO-SOURCE
+  > Task :CordovaLib:preBuild UP-TO-DATE
+  > Task :CordovaLib:preDebugBuild UP-TO-DATE
+  > Task :CordovaLib:writeDebugAarMetadata UP-TO-DATE
+  > Task :app:checkKotlinGradlePluginConfigurationErrors
+  > Task :CordovaLib:generateDebugResValues UP-TO-DATE
+  > Task :CordovaLib:generateDebugResources UP-TO-DATE
+  > Task :app:generateDebugBuildConfig UP-TO-DATE
+  > Task :CordovaLib:packageDebugResources UP-TO-DATE
+  > Task :CordovaLib:extractDeepLinksDebug UP-TO-DATE
+  > Task :CordovaLib:processDebugManifest UP-TO-DATE
+  > Task :CordovaLib:compileDebugLibraryResources UP-TO-DATE
+  > Task :CordovaLib:parseDebugLocalResources UP-TO-DATE
+  > Task :CordovaLib:generateDebugRFile UP-TO-DATE
+  > Task :CordovaLib:javaPreCompileDebug UP-TO-DATE
+  > Task :CordovaLib:compileDebugJavaWithJavac UP-TO-DATE
+  > Task :CordovaLib:bundleLibCompileToJarDebug UP-TO-DATE
+  > Task :CordovaLib:mergeDebugShaders UP-TO-DATE
+  > Task :CordovaLib:compileDebugShaders NO-SOURCE
+  > Task :CordovaLib:generateDebugAssets UP-TO-DATE
+  > Task :CordovaLib:packageDebugAssets UP-TO-DATE
+  > Task :app:checkDebugAarMetadata UP-TO-DATE
+  > Task :app:generateDebugResValues UP-TO-DATE
+  > Task :CordovaLib:processDebugJavaRes UP-TO-DATE
+  > Task :CordovaLib:bundleLibRuntimeToDirDebug UP-TO-DATE
+  > Task :CordovaLib:mergeDebugJniLibFolders UP-TO-DATE
+  > Task :CordovaLib:mergeDebugNativeLibs NO-SOURCE
+  > Task :app:mapDebugSourceSetPaths UP-TO-DATE
+  > Task :CordovaLib:copyDebugJniLibsProjectOnly UP-TO-DATE
+  > Task :app:generateDebugResources UP-TO-DATE
+  > Task :app:mergeDebugResources UP-TO-DATE
+  > Task :app:packageDebugResources UP-TO-DATE
+  > Task :app:parseDebugLocalResources UP-TO-DATE
+  > Task :app:createDebugCompatibleScreenManifests UP-TO-DATE
+  > Task :app:extractDeepLinksDebug UP-TO-DATE
+  > Task :app:processDebugMainManifest UP-TO-DATE
+  > Task :app:processDebugManifest UP-TO-DATE
+  > Task :app:processDebugManifestForPackage UP-TO-DATE
+  > Task :app:processDebugResources UP-TO-DATE
+  > Task :app:compileDebugKotlin NO-SOURCE
+  > Task :app:javaPreCompileDebug UP-TO-DATE
+  > Task :app:compileDebugJavaWithJavac UP-TO-DATE
+  > Task :app:mergeDebugShaders UP-TO-DATE
+  > Task :app:compileDebugShaders NO-SOURCE
+  > Task :app:generateDebugAssets UP-TO-DATE
+  > Task :app:mergeDebugAssets
+  > Task :app:processDebugJavaRes NO-SOURCE
+  > Task :app:mergeDebugJavaResource UP-TO-DATE
+  > Task :app:checkDebugDuplicateClasses UP-TO-DATE
+  > Task :app:desugarDebugFileDependencies UP-TO-DATE
+  > Task :app:mergeExtDexDebug UP-TO-DATE
+  > Task :app:mergeLibDexDebug UP-TO-DATE
+  > Task :app:dexBuilderDebug UP-TO-DATE
+  > Task :app:mergeProjectDexDebug UP-TO-DATE
+  > Task :app:mergeDebugJniLibFolders UP-TO-DATE
+  > Task :app:mergeDebugNativeLibs UP-TO-DATE
+  > Task :app:stripDebugDebugSymbols UP-TO-DATE
+  > Task :app:validateSigningDebug UP-TO-DATE
+  > Task :app:writeDebugAppMetadata UP-TO-DATE
+  > Task :app:writeDebugSigningConfigVersions UP-TO-DATE
+  > Task :app:compressDebugAssets
+  > Task :app:packageDebug
+  > Task :app:createDebugApkListingFileRedirect UP-TO-DATE
+  > Task :app:assembleDebug
+  > Task :app:cdvBuildDebug
+  
+  BUILD SUCCESSFUL in 6s
+  53 actionable tasks: 4 executed, 49 up-to-date
+  ✓ APK: Acode-1.11.8.apk (33.5 MB)
+  ✓ 路径: C:\Users\vhtmf\source\repos\Acode-All\Acode\platforms\android\app\build\outputs\apk\debug\Acode-1.11.8.apk
+  ✓ 构建流程未产生 git 可见的 Acode 仓库改动
+
+▶ 部署 APK 到手机 (adb)
+  ✓ HDC 设备: 2PM0223B21002707
+  APK: Acode-1.11.8.apk (33.5 MB)
+  推送到: /storage/media/100/local/files/Docs/Download/Acode-1.11.8.apk
+  FileTransfer finish, Size:35079657, File count = 1, time:601ms rate:58368.81kB/s
+  
+  ✓ 推送成功！请在手机文件管理器 → 下载 中点击安装
+
+══════════════════════════════════════════════
+  ✓ 全部完成！应用已部署到手机
+══════════════════════════════════════════════

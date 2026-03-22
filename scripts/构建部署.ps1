@@ -124,6 +124,29 @@ function 检查命令($命令, $提示) {
     }
 }
 
+function 执行外部命令并输出 {
+    param(
+        [Parameter(Mandatory)]
+        [string]$文件路径,
+
+        [string[]]$参数 = @()
+    )
+
+    # PowerShell 7 在 VS Code 宿主/transcript 下，原生命令接到实时管道
+    # （`2>&1 | ForEach-Object { Write-Host ... }`）时会偶发抛出
+    # “The pipeline has been stopped.”，即使底层 Cordova/Gradle 命令实际成功。
+    # 这里先完整捕获原生命令输出，再统一回放到宿主，避免宿主管道误中断把
+    # 构建脚本卡死在插件刷新、prepare、Gradle 或 HDC 推送阶段。
+    $命令输出 = & $文件路径 @参数 2>&1
+    $退出码 = $LASTEXITCODE
+
+    foreach ($输出项 in @($命令输出)) {
+        Write-Host "  $输出项"
+    }
+
+    return $退出码
+}
+
 # 不再依赖外部“构建部署.注入”脚本，避免隐藏构建期改写逻辑。调试相关平台改动统一保留在主脚本内。
 function 获取调试客户端脚本片段 {
     param(
@@ -1113,8 +1136,11 @@ function 安装Node依赖 {
             $包配置路径 = Join-Path $_.FullName "package.json"
             if (Test-Path $包配置路径) {
                 try {
-                    $包配置 = Get-Content $包配置路径 -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-                    $有入口声明 = $包配置.main -or $包配置.exports -or $包配置.module
+                    # 某些第三方包的 exports 键会同时包含 ./Ref 与 ./ref 这类大小写不同的合法条目。
+                    # PowerShell 默认把 JSON 解析成大小写不敏感对象时会直接抛错，中断整个脚本构建流程。
+                    # 这里改用哈希表保留原始键大小写，只为完成依赖完整性扫描，不改变包本身的解析语义。
+                    $包配置 = Get-Content $包配置路径 -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+                    $有入口声明 = $包配置.ContainsKey('main') -or $包配置.ContainsKey('exports') -or $包配置.ContainsKey('module')
                     if ($有入口声明) {
                         $源码文件数 = (Get-ChildItem $_.FullName -Recurse -Include "*.js","*.mjs","*.cjs" -ErrorAction SilentlyContinue |
                             Where-Object { $_.FullName -notmatch '[\\/]__tests__[\\/]|[\\/]test[\\/]' } |
@@ -1169,8 +1195,12 @@ function 获取CordovaAndroid版本约束 {
     }
 
     try {
-        $PackageJson = Get-Content $PackageJson路径 -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
-        $版本约束 = [string]$PackageJson.devDependencies."cordova-android"
+        $PackageJson = Get-Content $PackageJson路径 -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+        $开发依赖 = $PackageJson['devDependencies']
+        if (-not ($开发依赖 -is [System.Collections.IDictionary])) {
+            return $null
+        }
+        $版本约束 = [string]$开发依赖['cordova-android']
         if ([string]::IsNullOrWhiteSpace($版本约束)) {
             return $null
         }
@@ -1239,27 +1269,28 @@ function 获取本地Cordova插件列表 {
     }
 
     try {
-        $PackageJson = Get-Content $PackageJson路径 -Raw -Encoding UTF8 | ConvertFrom-Json -ErrorAction Stop
+        $PackageJson = Get-Content $PackageJson路径 -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -ErrorAction Stop
     } catch {
         输出错误 "无法解析 package.json，无法刷新本地 Cordova 插件"
         exit 1
     }
 
-    $Cordova插件配置 = $PackageJson.cordova.plugins
-    $开发依赖 = $PackageJson.devDependencies
-    if (-not $Cordova插件配置 -or -not $开发依赖) {
+    $Cordova配置 = $PackageJson['cordova']
+    $Cordova插件配置 = if ($Cordova配置 -is [System.Collections.IDictionary]) { $Cordova配置['plugins'] } else { $null }
+    $开发依赖 = $PackageJson['devDependencies']
+    if (-not ($Cordova插件配置 -is [System.Collections.IDictionary]) -or -not ($开发依赖 -is [System.Collections.IDictionary])) {
         return @()
     }
 
     $插件列表 = [System.Collections.Generic.List[hashtable]]::new()
-    foreach ($属性 in $开发依赖.PSObject.Properties) {
-        $插件ID = $属性.Name
+    foreach ($属性 in $开发依赖.GetEnumerator()) {
+        $插件ID = [string]$属性.Key
         $依赖值 = [string]$属性.Value
         if (-not $依赖值.StartsWith("file:")) {
             continue
         }
 
-        if (-not ($Cordova插件配置.PSObject.Properties.Name -contains $插件ID)) {
+        if (-not $Cordova插件配置.Contains($插件ID)) {
             continue
         }
 
@@ -1447,14 +1478,14 @@ function 刷新本地Cordova插件 {
 
         Write-Host "  刷新插件: $($插件.ID) <- $($插件.相对路径)" -ForegroundColor DarkGray
 
-        npx cordova plugin remove $($插件.ID) --nosave 2>&1 | ForEach-Object { Write-Host "  $_" }
-        if ($LASTEXITCODE -ne 0) {
+        $插件移除退出码 = 执行外部命令并输出 "npx" @("cordova", "plugin", "remove", $插件.ID, "--nosave")
+        if ($插件移除退出码 -ne 0) {
             输出错误 "cordova plugin remove 失败: $($插件.ID)"
             exit 1
         }
 
-        npx cordova plugin add $($插件.路径) --nosave 2>&1 | ForEach-Object { Write-Host "  $_" }
-        if ($LASTEXITCODE -ne 0) {
+        $插件添加退出码 = 执行外部命令并输出 "npx" @("cordova", "plugin", "add", $插件.路径, "--nosave")
+        if ($插件添加退出码 -ne 0) {
             输出错误 "cordova plugin add 失败: $($插件.ID)"
             exit 1
         }
@@ -1513,8 +1544,8 @@ function 重建CordovaAndroid平台 {
     if ($已存在平台) {
         输出步骤 "重建 Cordova Android 平台"
         Write-Host "  移除 Android 平台..." -ForegroundColor DarkGray
-        npx cordova platform remove android --nosave 2>&1 | ForEach-Object { Write-Host "  $_" }
-        if ($LASTEXITCODE -ne 0) {
+        $平台移除退出码 = 执行外部命令并输出 "npx" @("cordova", "platform", "remove", "android", "--nosave")
+        if ($平台移除退出码 -ne 0) {
             输出错误 "cordova platform remove android 失败"
             exit 1
         }
@@ -1523,8 +1554,8 @@ function 重建CordovaAndroid平台 {
     }
 
     Write-Host "  添加 Android 平台: $平台包" -ForegroundColor DarkGray
-    npx cordova platform add $平台包 --nosave 2>&1 | ForEach-Object { Write-Host "  $_" }
-    if ($LASTEXITCODE -ne 0) {
+    $平台添加退出码 = 执行外部命令并输出 "npx" @("cordova", "platform", "add", $平台包, "--nosave")
+    if ($平台添加退出码 -ne 0) {
         输出错误 "cordova platform add android 失败"
         exit 1
     }
@@ -1558,7 +1589,11 @@ function 设置Cordova平台 {
         }
 
         Write-Host "  Cordova prepare..." -ForegroundColor DarkGray
-        npx cordova prepare android 2>&1 | ForEach-Object { Write-Host "  $_" }
+        $Prepare退出码 = 执行外部命令并输出 "npx" @("cordova", "prepare", "android")
+        if ($Prepare退出码 -ne 0) {
+            输出错误 "Cordova prepare 失败"
+            exit 1
+        }
         输出成功 "Cordova prepare 完成"
     } finally {
         Pop-Location
@@ -1724,8 +1759,8 @@ function 构建前端 {
         }
 
         Write-Host "  rspack 构建 (mode=$Rspack模式)..." -ForegroundColor DarkGray
-        npx rspack --mode $Rspack模式 2>&1 | ForEach-Object { Write-Host "  $_" }
-        if ($LASTEXITCODE -ne 0) {
+        $Rspack退出码 = 执行外部命令并输出 "npx" @("rspack", "--mode", $Rspack模式)
+        if ($Rspack退出码 -ne 0) {
             输出错误 "rspack 构建失败"
             exit 1
         }
@@ -1765,8 +1800,8 @@ function 同步前端产物到平台 {
         }
 
         Write-Host "  Cordova prepare（同步最新 www/build 到 Android 平台）..." -ForegroundColor DarkGray
-        npx cordova prepare android 2>&1 | ForEach-Object { Write-Host "  $_" }
-        if ($LASTEXITCODE -ne 0) {
+        $同步Prepare退出码 = 执行外部命令并输出 "npx" @("cordova", "prepare", "android")
+        if ($同步Prepare退出码 -ne 0) {
             输出错误 "Cordova prepare 同步平台失败"
             exit 1
         }
@@ -1812,9 +1847,9 @@ function 使用本机Gradle构建APK {
     $Gradle参数 += $Gradle任务
 
     输出成功 "使用本机 Gradle: $script:Gradle路径"
-    & $script:Gradle路径 @Gradle参数 2>&1 | ForEach-Object { Write-Host "  $_" }
-    if ($LASTEXITCODE -ne 0) {
-        输出错误 "本机 Gradle 构建失败 (exit code: $LASTEXITCODE)"
+    $Gradle退出码 = 执行外部命令并输出 $script:Gradle路径 $Gradle参数
+    if ($Gradle退出码 -ne 0) {
+        输出错误 "本机 Gradle 构建失败 (exit code: $Gradle退出码)"
         exit 1
     }
 }
@@ -1959,8 +1994,8 @@ function 部署APK {
     } else {
         $远程路径 = "/storage/media/100/local/files/Docs/Download/$($APK文件项.Name)"
         Write-Host "  推送到: $远程路径" -ForegroundColor DarkGray
-        & $HDC程序路径 file send $APK文件项.FullName $远程路径 2>&1 | ForEach-Object { Write-Host "  $_" }
-        if ($LASTEXITCODE -eq 0) {
+        $Hdc推送退出码 = 执行外部命令并输出 $HDC程序路径 @("file", "send", $APK文件项.FullName, $远程路径)
+        if ($Hdc推送退出码 -eq 0) {
             输出成功 "推送成功！请在手机文件管理器 → 下载 中点击安装"
         } else {
             输出错误 "推送失败，请检查 HDC 连接和设备权限"
