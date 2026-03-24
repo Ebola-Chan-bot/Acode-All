@@ -201,6 +201,7 @@ function 获取调试服务器Axs下载地址 {
         [pscustomobject]$调试服务器元数据
     )
 
+    # 调试服务器现在会把 axs 二进制内容指纹编码进 URL 查询串；这里必须原样透传完整地址，不能做任何规范化或裁剪。否则 Terminal.refreshAxs 写入的 .download-manifest 仍然看不到版本变化，手机会继续复用旧 axs，导致源码里新增的后端日志和修复根本不会落到设备上。 仅调试用
     return [ordered]@{
         arm64 = $调试服务器元数据.axsUrls.arm64
         armv7 = $调试服务器元数据.axsUrls.armv7

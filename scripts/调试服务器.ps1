@@ -58,9 +58,29 @@ function 测试端口可连接([string]$主机, [int]$目标端口, [int]$超时
     }
 }
 
+function 清理启动器残留端口([int]$目标端口) {
+    $占用连接列表 = @(Get-NetTCPConnection -LocalPort $目标端口 -ErrorAction SilentlyContinue)
+    $占用进程ID列表 = @($占用连接列表 | Select-Object -ExpandProperty OwningProcess -Unique)
+
+    foreach ($占用进程ID in $占用进程ID列表) {
+        try {
+            # 默认后台模式必须在拉起新子进程前清掉残留监听；否则旧调试服务器会让后面的端口探测直接命中旧进程，启动器误判“新实例已就绪”，结果 metadata 保持旧地址，后续构建继续注入过期下载源。这里用独立前置清理逻辑，避免再依赖后文函数定义顺序。 仅调试用
+            $占用进程 = [System.Diagnostics.Process]::GetProcessById([int]$占用进程ID)
+            写启动器日志 "启动前清理残留端口占用: 端口=$目标端口 PID=$占用进程ID 进程=$($占用进程.ProcessName)"
+            $占用进程.Kill()
+            $占用进程.WaitForExit()
+        } catch {
+            写启动器日志 "启动前清理残留端口占用失败: 端口=$目标端口 PID=$占用进程ID 错误=$($_.Exception.Message)"
+            throw
+        }
+    }
+}
+
 function 启动调试服务器后台子进程 {
     if (Test-Path $后台启动日志) { Remove-Item $后台启动日志 -Force -ErrorAction SilentlyContinue }
     写启动器日志 "准备启动后台调试服务器: 端口=$端口 监视=$([bool]$监视) 仅本机=$([bool]$仅本机)"
+
+    清理启动器残留端口 $端口
 
     $参数列表 = @(
         "-NoProfile",
@@ -301,6 +321,7 @@ function 确保调试服务器证书([string]$主机IP, [int]$目标端口) {
 
 function 写入调试证书元数据([string]$主机IP, [int]$目标端口) {
     $axsBaseUrl = "https://${主机IP}:${目标端口}/__axs"
+    $axs版本 = 获取Axs资源版本映射
     $元数据 = [ordered]@{
         host = $主机IP
         port = $目标端口
@@ -309,10 +330,12 @@ function 写入调试证书元数据([string]$主机IP, [int]$目标端口) {
         scriptUrl = "https://${主机IP}:${目标端口}/__debug_client.js"
         logsUrl = "https://${主机IP}:${目标端口}/__logs"
         axsBaseUrl = $axsBaseUrl
+        axsVersions = $axs版本
         axsUrls = [ordered]@{
-            arm64 = "$axsBaseUrl/axs-musl-android-arm64"
-            armv7 = "$axsBaseUrl/axs-musl-android-armv7"
-            x64 = "$axsBaseUrl/axs-musl-android-x86_64"
+            # Terminal.refreshAxs 只拿下载 URL 写入 .download-manifest；之前局域网调试一直复用固定 /__axs 路径，导致 acodex-server/axs 二进制更新后手机仍命中旧 manifest，继续跑旧 axs，看不到最新后端日志。这里把 URL 绑定到当前二进制指纹，让内容变化时 manifest 必然失效并强制重新下载。 仅调试用
+            arm64 = "$axsBaseUrl/axs-musl-android-arm64?v=$($axs版本.arm64)"
+            armv7 = "$axsBaseUrl/axs-musl-android-armv7?v=$($axs版本.armv7)"
+            x64 = "$axsBaseUrl/axs-musl-android-x86_64?v=$($axs版本.x64)"
         }
         certificatePath = $调试证书Cer路径
         generatedAt = (Get-Date).ToString("o")
@@ -323,6 +346,8 @@ function 写入调试证书元数据([string]$主机IP, [int]$目标端口) {
         ($元数据 | ConvertTo-Json -Depth 4),
         [System.Text.UTF8Encoding]::new($false)
     )
+
+    return $元数据
 }
 
 # ─── 常量 ────────────────────────────────────────────────────────────
@@ -340,10 +365,45 @@ $script:Axs下载映射 = [ordered]@{
     "axs-musl-android-x86_64" = Join-Path $PSScriptRoot "..\acodex-server\target\x86_64-unknown-linux-musl\release\axs"
 }
 
+function 获取Axs资源版本映射 {
+    $版本映射 = [ordered]@{}
+
+    foreach ($文件名 in $script:Axs下载映射.Keys) {
+        $文件路径 = [System.IO.Path]::GetFullPath($script:Axs下载映射[$文件名])
+        if (-not (Test-Path $文件路径 -PathType Leaf)) {
+            # 局域网调试只要求当前设备架构可用，不能因为未构建的其他架构产物缺失就让整个调试服务器起不来；否则 metadata 不会刷新，arm64 设备仍会继续复用旧 axs。缺失架构保留稳定占位值，真正请求该资源时再由下载端点按现有逻辑返回 503。 仅调试用
+            $版本映射[$文件名.Replace("axs-musl-android-", "").Replace("x86_64", "x64")] = "missing"
+            continue
+        }
+
+        # 这里必须基于文件内容生成稳定指纹，而不能只看时间戳；局域网调试复现里真正的问题是 URL 长期不变导致 .download-manifest 不失效，手机继续复用旧 axs。只有内容指纹进 URL，才能确保每次换二进制都强制刷新。同时这里改成纯 .NET SHA256，避免默认后台子进程在某些 PowerShell 宿主里拿不到 Get-FileHash 时直接起不来。 仅调试用
+        $文件流 = [System.IO.File]::OpenRead($文件路径)
+        try {
+            $哈希器 = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                $哈希字节 = $哈希器.ComputeHash($文件流)
+            } finally {
+                $哈希器.Dispose()
+            }
+        } finally {
+            $文件流.Dispose()
+        }
+
+        $哈希 = ([System.BitConverter]::ToString($哈希字节)).Replace("-", "").ToLowerInvariant()
+        $版本映射[$文件名.Replace("axs-musl-android-", "").Replace("x86_64", "x64")] = $哈希.Substring(0, 16)
+    }
+
+    return $版本映射
+}
+
 function 获取Axs下载响应 {
     param(
         [string]$路径
     )
+
+    if ($路径.Contains('?')) {
+        $路径 = $路径.Split('?', 2)[0]
+    }
 
     $文件名 = $路径.Substring("/__axs/".Length)
     if ([string]::IsNullOrWhiteSpace($文件名)) {
@@ -1242,7 +1302,7 @@ function 处理新连接([System.Net.Sockets.TcpClient]$tcp客户端) {
 $局域网IP = if ($仅本机) { "127.0.0.1" } else { 获取局域网IP }
 $Www目录 = Join-Path (Resolve-Path (Join-Path $PSScriptRoot "..")) "Acode\www"
 $script:调试服务器证书 = 确保调试服务器证书 -主机IP $局域网IP -目标端口 $端口
-写入调试证书元数据 -主机IP $局域网IP -目标端口 $端口
+$调试服务器元数据 = 写入调试证书元数据 -主机IP $局域网IP -目标端口 $端口
 
 清理端口占用 $端口
 配置防火墙 $端口
@@ -1264,9 +1324,9 @@ Write-Host "https://${局域网IP}:${端口}/__logs" -ForegroundColor Cyan -NoNe
 Write-Host "        ║" -ForegroundColor Green
 追加调试日志 "║ 日志:   https://${局域网IP}:${端口}/__logs        ║"
 Write-Host "║ AXS:    " -ForegroundColor Green -NoNewline
-Write-Host "https://${局域网IP}:${端口}/__axs/axs-musl-android-arm64" -ForegroundColor Cyan -NoNewline
+Write-Host $调试服务器元数据.axsUrls.arm64 -ForegroundColor Cyan -NoNewline
 Write-Host " ║" -ForegroundColor Green
-追加调试日志 "║ AXS:    https://${局域网IP}:${端口}/__axs/axs-musl-android-arm64 ║"
+追加调试日志 "║ AXS:    $($调试服务器元数据.axsUrls.arm64) ║"
 Write-Host "║ 监视:   " -ForegroundColor Green -NoNewline
 if ($监视) { Write-Host "已开启" -ForegroundColor Green -NoNewline } else { Write-Host "未开启" -ForegroundColor DarkGray -NoNewline }
 Write-Host "                              ║" -ForegroundColor Green
