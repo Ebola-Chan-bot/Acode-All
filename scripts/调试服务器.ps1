@@ -8,7 +8,7 @@
     通过局域网接收手机端 Acode 的 console 日志，
     监视 www/build/ 变化并通知热重载，可在浏览器查看日志面板。
 .PARAMETER 端口
-  监听端口（默认 8092）
+    调试服务器端口固定为仓库常量；传入非固定值会直接失败
 .PARAMETER 监视
   监视 www/build/ 变化并推送热重载
 .PARAMETER 仅本机
@@ -17,7 +17,7 @@
   前台运行服务器（默认行为为启动后台子进程并立即返回）
 #>
 param(
-    [int]$端口 = 8092,
+    [int]$端口 = 0,
     [switch]$监视,
     [switch]$仅本机,
     [switch]$前台,
@@ -25,6 +25,13 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+. (Join-Path $PSScriptRoot "仓库常量.ps1")
+$仓库固定调试服务器端口 = 获取仓库固定调试服务器端口
+if ($PSBoundParameters.ContainsKey('端口')) {
+    断言仓库固定调试服务器端口 -目标端口 $端口 -来源 'scripts/调试服务器.ps1 param'
+}
+$端口 = $仓库固定调试服务器端口
 
 $脚本路径 = $MyInvocation.MyCommand.Path
 $脚本目录 = Split-Path -Parent $脚本路径

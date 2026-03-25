@@ -22,7 +22,7 @@
     clean        = 清理构建产物
 
 .PARAMETER 设备模式
-  设备连接方式: adb | hdc（默认 adb）
+    设备连接方式: adb | hdc（不指定时默认优先 adb，失败后再尝试 hdc）
 
 .PARAMETER 构建模式
   构建模式: debug | release（默认 debug）
@@ -34,13 +34,13 @@
   NDK 编译使用的最低 Android API 等级（默认 21）
 
 .PARAMETER Axs下载源
-    AXS 下载源: default | debug-server（默认 default）
+    AXS 下载源: default | debug-server（默认 debug-server）
 
 .PARAMETER 注入调试日志
     是否向构建产物接入局域网调试客户端（默认开启，release 构建自动忽略）
 
 .EXAMPLE
-  .\构建部署.ps1                               # 完整流程
+    .\构建部署.ps1                               # 默认执行 full + 自动设备检测(adb→hdc) + debug + debug-server
   .\构建部署.ps1 -动作 setup                  # 仅初始化环境
   .\构建部署.ps1 -动作 build-server           # 仅编译 acodex-server
   .\构建部署.ps1 -动作 build-apk              # 仅构建 APK
@@ -57,7 +57,7 @@ param(
     [string]$动作 = "full",
 
     [ValidateSet("adb", "hdc")]
-    [string]$设备模式 = "adb",
+    [string]$设备模式 = "hdc",
 
     [ValidateSet("debug", "release")]
     [string]$构建模式 = "debug",
@@ -66,7 +66,8 @@ param(
     [string]$应用类型 = "paid",
 
     [ValidateSet("default", "debug-server")]
-    [string]$Axs下载源 = "default",
+    # 当前仓库默认调试链路依赖局域网调试服务器分发 axs；这里直接把默认值固定成 debug-server，避免无参数执行时又退回 release 下载源，导致本次构建部署链路与显式参数行为不一致。 仅调试用
+    [string]$Axs下载源 = "debug-server",
 
     [Alias("启用调试客户端")]
     [bool]$注入调试日志 = $true,
@@ -75,6 +76,14 @@ param(
 
     [int]$NDK接口级别 = 28
 )
+
+$设备模式是否显式指定 = $PSBoundParameters.ContainsKey('设备模式')
+if (-not $设备模式是否显式指定) {
+    # 这里保留参数默认值仅为了维持 ValidateSet/调用兼容；真正的“未指定设备模式”语义
+    # 是仓库约定的自动检测顺序：先 adb，再 hdc，二者都失败才报错。这个分支是有意
+    # 设计的默认行为，不是偷偷切换设备模式。 仅调试用
+    $设备模式 = 'adb'
+}
 
 $ErrorActionPreference = "Continue"
 
@@ -110,6 +119,9 @@ function 更新Acode工作目录([string]$根目录) {
 }
 
 更新Acode工作目录 $Acode源码根目录
+
+. (Join-Path $PSScriptRoot "仓库常量.ps1")
+$仓库固定调试服务器端口 = 获取仓库固定调试服务器端口
 
 # ─── 工具函数 ─────────────────────────────────────────────────────────
 function 输出步骤($消息) { Write-Host "`n▶ $消息" -ForegroundColor Cyan }
@@ -189,9 +201,13 @@ function 获取调试服务器TLS元数据 {
     }
 
     try {
-        return Get-Content $元数据路径 -Raw -Encoding UTF8 | ConvertFrom-Json
+        $元数据 = Get-Content $元数据路径 -Raw -Encoding UTF8 | ConvertFrom-Json
+        # 这里必须把调试服务器端口和仓库常量绑定死；一旦继续接受旧 metadata 里的随机端口，构建脚本就会把过期调试地址重新注入 APK，手机端永远连到错误服务器。直接 fail fast，强制重新启动固定端口的调试服务器。 仅调试用
+        断言仓库固定调试服务器端口 -目标端口 ([int]$元数据.port) -来源 'scripts/构建部署.ps1 metadata'
+        return $元数据
     } catch {
         输出错误 "调试服务器元数据解析失败: $元数据路径"
+        输出错误 $_.Exception.Message
         exit 1
     }
 }
@@ -207,6 +223,26 @@ function 获取调试服务器Axs下载地址 {
         armv7 = $调试服务器元数据.axsUrls.armv7
         x64 = $调试服务器元数据.axsUrls.x64
     }
+}
+
+function 清空调试服务器输出日志 {
+    $调试服务器日志路径列表 = @(
+        (Join-Path $工作区根目录 "scripts/logs/调试服务器-运行时.log"),
+        (Join-Path $工作区根目录 "scripts/logs/调试服务器-启动器.log")
+    )
+
+    foreach ($日志路径 in $调试服务器日志路径列表) {
+        if (-not (Test-Path $日志路径 -PathType Leaf)) {
+            continue
+        }
+
+        # 构建部署前必须先把调试服务器输出日志清空；否则浏览器日志面板和本地日志文件会混入上一次构建
+        # 的历史输出，后续一旦出现新问题，就无法判断日志到底对应当前 APK 还是旧构建。这里直接截断同一路径，
+        # 保留文件名与调试服务器现有输出约定不变，同时保证本次构建后的手机日志是干净起点。 仅调试用
+        [System.IO.File]::WriteAllText($日志路径, "", [System.Text.UTF8Encoding]::new($false))
+    }
+
+    输出成功 "已清空调试服务器输出日志"
 }
 
 function 重置平台终端Axs下载改动 {
@@ -1905,31 +1941,35 @@ function 检测设备连接 {
             }
         }
 
-        # ADB 与 HDC 都是脚本正式支持的设备连接方式。
-        # 当调用方选择 adb 模式时，这里优先尝试 adb；若当前环境下 adb 不可用
-        # 或未发现设备，则继续尝试 hdc。这是同级的正常功能路径，不属于兜底。
-        if (-not (Test-Path $HDC程序路径)) {
-            $已找到HDC = Get-Command hdc -ErrorAction SilentlyContinue
-            if ($已找到HDC) {
-                $script:HDC程序路径 = $已找到HDC.Source
+        # 未显式指定设备模式时，仓库默认行为就是“先 adb，再 hdc”。这是为了让
+        # `./构建部署.ps1` 在常用场景下直接工作，不需要调用方记住当前电脑到底
+        # 是 adb 直装还是 hdc 推送链路；只有显式指定了设备模式，才按该模式严格执行。 仅调试用
+        if (-not $设备模式是否显式指定) {
+            if (-not (Test-Path $HDC程序路径)) {
+                $已找到HDC = Get-Command hdc -ErrorAction SilentlyContinue
+                if ($已找到HDC) {
+                    $script:HDC程序路径 = $已找到HDC.Source
+                }
             }
-        }
 
-        if (Test-Path $HDC程序路径) {
-            $设备列表 = & $HDC程序路径 list targets 2>&1
-            if ($设备列表 -notmatch "^\[Empty\]$" -and -not [string]::IsNullOrWhiteSpace($设备列表)) {
-                $script:设备模式 = "hdc"
-                输出成功 "HDC 设备: $($设备列表.Trim())"
-                return
+            if (Test-Path $HDC程序路径) {
+                $设备列表 = & $HDC程序路径 list targets 2>&1
+                if ($设备列表 -notmatch "^\[Empty\]$" -and -not [string]::IsNullOrWhiteSpace($设备列表)) {
+                    $script:设备模式 = "hdc"
+                    输出成功 "ADB 不可用，按默认顺序切换到 HDC: $($设备列表.Trim())"
+                    return
+                }
             }
-        }
 
-        输出错误 "未检测到任何设备（ADB 和 HDC 均无响应），请确认："
+            输出错误 "未检测到任何设备（已按默认顺序依次尝试 ADB、HDC），请确认："
+        } else {
+            输出错误 "未检测到 ADB 设备，请确认："
+        }
         输出错误 "  1. 手机已通过 USB 连接到电脑"
         输出错误 "  2. 手机已开启 USB 调试 / 开发者模式"
         输出错误 "  3. 手机上已授权此电脑的调试"
         if (-not $有ADB) {
-            输出错误 "  4. 当前未找到 adb，且 hdc 也不可用"
+            输出错误 "  4. 当前未找到 adb"
         }
         exit 1
     } else {
@@ -2050,6 +2090,7 @@ switch ($动作) {
 
     "build-apk" {
         初始化构建环境
+        清空调试服务器输出日志
         安装Node依赖
         开始源码保护
         设置Cordova平台
@@ -2072,6 +2113,7 @@ switch ($动作) {
     "full" {
         初始化构建环境
         初始化子模块
+        清空调试服务器输出日志
         安装Node依赖
         开始源码保护
         设置Cordova平台
