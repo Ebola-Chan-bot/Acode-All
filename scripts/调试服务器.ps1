@@ -706,9 +706,13 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
                 }
             },true);
 
+            var lastScrollEmitTs=0;
             document.addEventListener("scroll",function(event){
                 var target=event&&event.target;
                 if(!target||!target.classList||!target.classList.contains("xterm-viewport"))return;
+                var now=Date.now();
+                if(now-lastScrollEmitTs<2000)return;
+                lastScrollEmitTs=now;
                 emitTerminalLayout("viewport-scroll",{
                     scrollTop:typeof target.scrollTop==="number"?target.scrollTop:null,
                     scrollHeight:typeof target.scrollHeight==="number"?target.scrollHeight:null,
@@ -719,7 +723,6 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
             if(window.visualViewport&&typeof window.visualViewport.addEventListener==="function"){
                 window.visualViewport.addEventListener("resize",function(){
                     emitTerminalLayout("visualViewport-resize",{},"info");
-                    setTimeout(function(){emitTerminalLayout("visualViewport-resize-settled",{},"info")},80);
                 },true);
             }
 
@@ -754,7 +757,7 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
                 send({
                     type:"console",
                     level:"debug",
-                    args:["[fetch]",method,url,"begin",{body:body,layout:collectTerminalLayoutSnapshot()}],
+                    args:["[fetch]",method,url,"begin",{body:body}],
                     timestamp:startedAt
                 });
             }
@@ -773,7 +776,7 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
                     send({
                         type:"console",
                         level:"debug",
-                        args:["[fetch]",method,url,"resolved","status="+response.status,"ok="+(!!response.ok),"elapsedMs="+(Date.now()-startedAt),{layout:collectTerminalLayoutSnapshot()}],
+                        args:["[fetch]",method,url,"resolved","status="+response.status,"ok="+(!!response.ok),"elapsedMs="+(Date.now()-startedAt)],
                         timestamp:Date.now()
                     });
                 }
