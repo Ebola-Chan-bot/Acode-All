@@ -640,11 +640,48 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
                 terminals:terminals
             };
         }
+        function summarizeTerminalLayoutSnapshot(snapshot){
+            snapshot=snapshot||{};
+            var terminals=Array.isArray(snapshot.terminals)?snapshot.terminals:[];
+            return {
+                visibilityState:snapshot.visibilityState||null,
+                activeTab:snapshot.activeTab||null,
+                innerWidth:typeof snapshot.innerWidth==="number"?snapshot.innerWidth:null,
+                innerHeight:typeof snapshot.innerHeight==="number"?snapshot.innerHeight:null,
+                visualViewport:snapshot.visualViewport||null,
+                terminalCount:terminals.length,
+                terminals:terminals.map(function(terminal){
+                    return {
+                        index:terminal.index,
+                        id:terminal.id||null,
+                        connected:!!terminal.connected,
+                        hasOffsetParent:!!terminal.hasOffsetParent,
+                        rowCount:typeof terminal.rowCount==="number"?terminal.rowCount:null,
+                        nonEmptyRowCount:typeof terminal.nonEmptyRowCount==="number"?terminal.nonEmptyRowCount:null,
+                        rowTextSample:terminal.rowTextSample||null,
+                        viewportScrollTop:typeof terminal.viewportScrollTop==="number"?terminal.viewportScrollTop:null,
+                        viewportScrollHeight:typeof terminal.viewportScrollHeight==="number"?terminal.viewportScrollHeight:null,
+                        viewportClientHeight:typeof terminal.viewportClientHeight==="number"?terminal.viewportClientHeight:null
+                    };
+                })
+            };
+        }
+        function shouldEmitTerminalLayout(reason,snapshot){
+            snapshot=snapshot||{};
+            var terminals=Array.isArray(snapshot.terminals)?snapshot.terminals:[];
+            var activeTab=typeof snapshot.activeTab==="string"?snapshot.activeTab:"";
+            if(terminals.length>0)return true;
+            if(/^Terminal\b/i.test(activeTab))return true;
+            // Exit-code-182 diagnosis depends on bootstrap/exit timing, not viewport churn while a non-terminal tab is active.
+            return reason==="viewport-touchstart"||reason==="terminal-touchstart"||reason==="viewport-scroll";
+        }
         function emitTerminalLayout(reason,extra,level){
+            var snapshot=collectTerminalLayoutSnapshot();
+            if(!shouldEmitTerminalLayout(reason,snapshot))return;
             send({
                 type:"console",
                 level:level||"debug",
-                args:["[terminal-layout]",reason,extra||{},collectTerminalLayoutSnapshot()],
+                args:["[terminal-layout]",reason,extra||{},summarizeTerminalLayoutSnapshot(snapshot)],
                 timestamp:Date.now()
             });
         }
