@@ -105,6 +105,7 @@ $Acodex根目录     = Join-Path $工作区根目录 "acodex-server"
 $HDC程序路径      = "C:\Program Files (x86)\HiSuite\hwtools\hdc.exe"
 $构建缓存目录     = Join-Path $工作区根目录 "scripts/logs/.build-cache"
 $构建缓存文件路径 = Join-Path $构建缓存目录 "state.json"
+$script:AcodePackage元数据缓存 = $null
 
 function 更新Acode工作目录([string]$根目录) {
     $script:Acode根目录     = $根目录
@@ -116,6 +117,7 @@ function 更新Acode工作目录([string]$根目录) {
     $script:发布APK输出目录 = Join-Path $script:平台根目录 "app/build/outputs/apk/release"
     $script:配置XML路径     = Join-Path $根目录 "config.xml"
     $script:Www目录         = Join-Path $根目录 "www"
+    $script:AcodePackage元数据缓存 = $null
 }
 
 更新Acode工作目录 $Acode源码根目录
@@ -157,6 +159,147 @@ function 执行外部命令并输出 {
     }
 
     return $退出码
+}
+
+function 执行Node脚本并捕获输出 {
+    param(
+        [Parameter(Mandatory)]
+        [string]$脚本,
+
+        [string[]]$参数 = @()
+    )
+
+    # Windows PowerShell 5.1 调原生进程时会改写 `node -e` 的参数，把脚本里的字面量引号吞掉，
+    # 导致原本合法的 JS 被拼成语法错误。这里改成通过 stdin 喂给 `node -`，让脚本内容不再经过
+    # PowerShell 的原生命令参数重写路径，避免再次误报“package.json 无法解析”。 仅调试用
+    $命令输出 = $脚本 | & node "-" @参数 2>&1
+    return [pscustomobject]@{
+        退出码 = $LASTEXITCODE
+        输出   = @($命令输出)
+    }
+}
+
+function 获取含入口声明的一级依赖目录映射([string]$依赖包目录) {
+    if (-not (Test-Path $依赖包目录 -PathType Container)) {
+        return @{}
+    }
+
+    # 这里不能继续依赖 PowerShell 的 ConvertFrom-Json -AsHashtable：当前机器上的构建宿主是
+    # Windows PowerShell 5.1，它不支持该参数，之前会把 node_modules 扫描悄悄降级成“每个包都解析失败后吞掉异常”。
+    # 依赖完整性扫描只需要知道一级包的 package.json 是否声明了 main/exports/module，直接交给已存在的 Node.js
+    # 一次性批量处理最快，也能保留 JSON 键大小写，不再受 PowerShell 解析器版本限制。 仅调试用
+    $节点脚本 = @'
+const fs = require("fs");
+const path = require("path");
+const root = process.argv[2];
+const result = [];
+for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+  if (!entry.isDirectory()) continue;
+  const packageJsonPath = path.join(root, entry.name, "package.json");
+  if (!fs.existsSync(packageJsonPath)) continue;
+  try {
+    const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+    if (
+      pkg &&
+      typeof pkg === "object" &&
+      (Object.prototype.hasOwnProperty.call(pkg, "main") ||
+        Object.prototype.hasOwnProperty.call(pkg, "exports") ||
+        Object.prototype.hasOwnProperty.call(pkg, "module"))
+    ) {
+      result.push(entry.name);
+    }
+  } catch {}
+}
+process.stdout.write(JSON.stringify(result));
+'@
+
+    $节点执行结果 = 执行Node脚本并捕获输出 -脚本 $节点脚本 -参数 @($依赖包目录)
+    if ($节点执行结果.退出码 -ne 0) {
+        return @{}
+    }
+
+    $原始输出 = ($节点执行结果.输出 -join "`n").Trim()
+    if ([string]::IsNullOrWhiteSpace($原始输出)) {
+        return @{}
+    }
+
+    $目录列表 = @($原始输出 | ConvertFrom-Json)
+    $目录映射 = @{}
+    foreach ($目录名 in $目录列表) {
+        $目录映射[[string]$目录名] = $true
+    }
+
+    return $目录映射
+}
+
+function 获取AcodePackage元数据 {
+    if ($null -ne $script:AcodePackage元数据缓存) {
+        return $script:AcodePackage元数据缓存
+    }
+
+    $PackageJson路径 = Join-Path $Acode根目录 "package.json"
+    if (-not (Test-Path $PackageJson路径 -PathType Leaf)) {
+        return $null
+    }
+
+    # 这里改成统一走 Node.js 解析 Acode/package.json。根因不是 package.json 本身损坏，
+    # 而是构建脚本运行在 Windows PowerShell 5.1 时不支持 ConvertFrom-Json -AsHashtable，
+    # 之前会误报“无法解析 package.json，无法刷新本地 Cordova 插件”。Node 已经是脚本硬依赖，
+    # 直接用它提取 cordova-android 约束和 file: 本地插件列表，既保留键大小写，也避免宿主版本差异。 仅调试用
+    $节点脚本 = @'
+const fs = require("fs");
+const packageJsonPath = process.argv[2];
+const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+const devDependencies = pkg.devDependencies && typeof pkg.devDependencies === "object" ? pkg.devDependencies : {};
+const cordova = pkg.cordova && typeof pkg.cordova === "object" ? pkg.cordova : {};
+const cordovaPlugins = cordova.plugins && typeof cordova.plugins === "object" ? cordova.plugins : {};
+const localPlugins = Object.entries(devDependencies)
+  .filter(([pluginId, value]) => typeof value === "string" && value.startsWith("file:") && Object.prototype.hasOwnProperty.call(cordovaPlugins, pluginId))
+  .map(([pluginId, value]) => ({ id: pluginId, relativePath: value.slice(5).replace(/\//g, "\\") }));
+process.stdout.write(JSON.stringify({
+  cordovaAndroidVersion: typeof devDependencies["cordova-android"] === "string" ? devDependencies["cordova-android"].trim() : null,
+  localPlugins,
+}));
+'@
+
+    $节点执行结果 = 执行Node脚本并捕获输出 -脚本 $节点脚本 -参数 @($PackageJson路径)
+    if ($节点执行结果.退出码 -ne 0) {
+        输出错误 "无法解析 package.json：$PackageJson路径"
+        foreach ($输出项 in $节点执行结果.输出) {
+            Write-Host "  $输出项"
+        }
+        exit 1
+    }
+
+    $原始输出 = ($节点执行结果.输出 -join "`n").Trim()
+    if ([string]::IsNullOrWhiteSpace($原始输出)) {
+        输出错误 "无法解析 package.json：Node 未返回任何元数据"
+        exit 1
+    }
+
+    try {
+        $解析结果 = $原始输出 | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        输出错误 "无法解析 package.json：Node 返回的元数据不是有效 JSON"
+        输出错误 $_.Exception.Message
+        exit 1
+    }
+
+    $本地插件列表 = [System.Collections.Generic.List[object]]::new()
+    foreach ($插件 in @($解析结果.localPlugins)) {
+        $相对路径 = [string]$插件.relativePath
+        $本地插件列表.Add([pscustomobject]@{
+            ID     = [string]$插件.id
+            路径   = Join-Path $Acode根目录 $相对路径
+            相对路径 = $相对路径
+        })
+    }
+
+    $script:AcodePackage元数据缓存 = [pscustomobject]@{
+        CordovaAndroid版本约束 = [string]$解析结果.cordovaAndroidVersion
+        本地插件列表           = @($本地插件列表)
+    }
+    return $script:AcodePackage元数据缓存
 }
 
 # 不再依赖外部“构建部署.注入”脚本，避免隐藏构建期改写逻辑。调试相关平台改动统一保留在主脚本内。
@@ -1169,22 +1312,13 @@ function 安装Node依赖 {
 
         $残缺包列表 = [System.Collections.Generic.List[string]]::new()
         $依赖包目录 = Join-Path $Acode根目录 "node_modules"
+        $含入口声明目录映射 = 获取含入口声明的一级依赖目录映射 $依赖包目录
         Get-ChildItem $依赖包目录 -Directory -ErrorAction SilentlyContinue | ForEach-Object {
-            $包配置路径 = Join-Path $_.FullName "package.json"
-            if (Test-Path $包配置路径) {
-                try {
-                    # 某些第三方包的 exports 键会同时包含 ./Ref 与 ./ref 这类大小写不同的合法条目。
-                    # PowerShell 默认把 JSON 解析成大小写不敏感对象时会直接抛错，中断整个脚本构建流程。
-                    # 这里改用哈希表保留原始键大小写，只为完成依赖完整性扫描，不改变包本身的解析语义。
-                    $包配置 = Get-Content $包配置路径 -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable -ErrorAction Stop
-                    $有入口声明 = $包配置.ContainsKey('main') -or $包配置.ContainsKey('exports') -or $包配置.ContainsKey('module')
-                    if ($有入口声明) {
-                        $源码文件数 = (Get-ChildItem $_.FullName -Recurse -Include "*.js","*.mjs","*.cjs" -ErrorAction SilentlyContinue |
-                            Where-Object { $_.FullName -notmatch '[\\/]__tests__[\\/]|[\\/]test[\\/]' } |
-                            Select-Object -First 1).Count
-                        if ($源码文件数 -eq 0) { $残缺包列表.Add($_.Name) }
-                    }
-                } catch {}
+            if ($含入口声明目录映射.ContainsKey($_.Name)) {
+                $源码文件数 = (Get-ChildItem $_.FullName -Recurse -Include "*.js","*.mjs","*.cjs" -ErrorAction SilentlyContinue |
+                    Where-Object { $_.FullName -notmatch '[\\/]__tests__[\\/]|[\\/]test[\\/]' } |
+                    Select-Object -First 1).Count
+                if ($源码文件数 -eq 0) { $残缺包列表.Add($_.Name) }
             }
         }
         if ($残缺包列表.Count -gt 0) {
@@ -1226,25 +1360,17 @@ function 安装Node依赖 {
 }
 
 function 获取CordovaAndroid版本约束 {
-    $PackageJson路径 = Join-Path $Acode根目录 "package.json"
-    if (-not (Test-Path $PackageJson路径)) {
+    $Package元数据 = 获取AcodePackage元数据
+    if ($null -eq $Package元数据) {
         return $null
     }
 
-    try {
-        $PackageJson = Get-Content $PackageJson路径 -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -ErrorAction Stop
-        $开发依赖 = $PackageJson['devDependencies']
-        if (-not ($开发依赖 -is [System.Collections.IDictionary])) {
-            return $null
-        }
-        $版本约束 = [string]$开发依赖['cordova-android']
-        if ([string]::IsNullOrWhiteSpace($版本约束)) {
-            return $null
-        }
-        return $版本约束.Trim()
-    } catch {
+    $版本约束 = [string]$Package元数据.CordovaAndroid版本约束
+    if ([string]::IsNullOrWhiteSpace($版本约束)) {
         return $null
     }
+
+    return $版本约束.Trim()
 }
 
 function 获取已安装Gradle目录([string]$Gradle版本) {
@@ -1300,47 +1426,16 @@ function 获取已安装CordovaAndroid版本 {
 }
 
 function 获取本地Cordova插件列表 {
-    $PackageJson路径 = Join-Path $Acode根目录 "package.json"
-    if (-not (Test-Path $PackageJson路径)) {
+    $Package元数据 = 获取AcodePackage元数据
+    if ($null -eq $Package元数据) {
         return @()
     }
 
-    try {
-        $PackageJson = Get-Content $PackageJson路径 -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable -ErrorAction Stop
-    } catch {
-        输出错误 "无法解析 package.json，无法刷新本地 Cordova 插件"
-        exit 1
-    }
-
-    $Cordova配置 = $PackageJson['cordova']
-    $Cordova插件配置 = if ($Cordova配置 -is [System.Collections.IDictionary]) { $Cordova配置['plugins'] } else { $null }
-    $开发依赖 = $PackageJson['devDependencies']
-    if (-not ($Cordova插件配置 -is [System.Collections.IDictionary]) -or -not ($开发依赖 -is [System.Collections.IDictionary])) {
+    if ($null -eq $Package元数据.本地插件列表) {
         return @()
     }
 
-    $插件列表 = [System.Collections.Generic.List[hashtable]]::new()
-    foreach ($属性 in $开发依赖.GetEnumerator()) {
-        $插件ID = [string]$属性.Key
-        $依赖值 = [string]$属性.Value
-        if (-not $依赖值.StartsWith("file:")) {
-            continue
-        }
-
-        if (-not $Cordova插件配置.Contains($插件ID)) {
-            continue
-        }
-
-        $相对路径 = $依赖值.Substring(5).Replace('/', '\\')
-        $绝对路径 = Join-Path $Acode根目录 $相对路径
-        $插件列表.Add(@{
-            ID = $插件ID
-            路径 = $绝对路径
-            相对路径 = $相对路径
-        })
-    }
-
-    return @($插件列表)
+    return @($Package元数据.本地插件列表)
 }
 
 function 获取本地Cordova插件信息([string]$插件ID) {
