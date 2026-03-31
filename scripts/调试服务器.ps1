@@ -1,4 +1,4 @@
-<#!
+﻿<#!
 .SYNOPSIS
     HDC 远程调试服务器（纯 PowerShell / .NET Socket + TLS 实现）
 .DESCRIPTION
@@ -8,6 +8,261 @@
     通过局域网接收手机端 Acode 的 console 日志，
     监视 www/build/ 变化并通知热重载，可在浏览器查看日志面板。
 .PARAMETER 端口
+    调试服务器端口固定为仓库常量；传入非固定值会直接失败
+.PARAMETER 监视
+  监视 www/build/ 变化并推送热重载
+.PARAMETER 仅本机
+  仅监听 127.0.0.1
+.PARAMETER 前台
+  前台运行服务器（默认行为为启动后台子进程并立即返回）
+#>
+param(
+    [int]$端口 = 0,
+    [switch]$监视,
+    [switch]$仅本机,
+    [switch]$前台,
+    [switch]$内部后台进程
+)
+
+$ErrorActionPreference = "Stop"
+
+. (Join-Path $PSScriptRoot "仓库常量.ps1")
+$仓库固定调试服务器端口 = 获取仓库固定调试服务器端口
+if ($PSBoundParameters.ContainsKey('端口')) {
+    断言仓库固定调试服务器端口 -目标端口 $端口 -来源 'scripts/调试服务器.ps1 param'
+}
+$端口 = $仓库固定调试服务器端口
+
+$脚本路径 = $MyInvocation.MyCommand.Path
+$脚本目录 = Split-Path -Parent $脚本路径
+$日志目录 = Join-Path $脚本目录 "logs"
+if (-not (Test-Path $日志目录)) { New-Item -ItemType Directory -Path $日志目录 -Force | Out-Null }
+$后台启动日志 = Join-Path $日志目录 "调试服务器-启动器.log"
+
+function 写启动器日志([string]$消息) {
+    $时间戳 = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    [System.IO.File]::AppendAllText(
+        $后台启动日志,
+        "$时间戳 $消息`r`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+}
+
+function 测试端口可连接([string]$主机, [int]$目标端口, [int]$超时毫秒 = 1000) {
+    $客户端 = $null
+    try {
+        $客户端 = [System.Net.Sockets.TcpClient]::new()
+        $异步结果 = $客户端.BeginConnect($主机, $目标端口, $null, $null)
+        if (-not $异步结果.AsyncWaitHandle.WaitOne($超时毫秒, $false)) {
+            return $false
+        }
+        $客户端.EndConnect($异步结果)
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if ($客户端) { $客户端.Dispose() }
+    }
+}
+
+function 清理启动器残留端口([int]$目标端口) {
+    $占用连接列表 = @(Get-NetTCPConnection -LocalPort $目标端口 -ErrorAction SilentlyContinue)
+    $占用进程ID列表 = @($占用连接列表 | Select-Object -ExpandProperty OwningProcess -Unique)
+
+    foreach ($占用进程ID in $占用进程ID列表) {
+        try {
+            # 默认后台模式必须在拉起新子进程前清掉残留监听；否则旧调试服务器会让后面的端口探测直接命中旧进程，启动器误判“新实例已就绪”，结果 metadata 保持旧地址，后续构建继续注入过期下载源。这里用独立前置清理逻辑，避免再依赖后文函数定义顺序。 仅调试用
+            $占用进程 = [System.Diagnostics.Process]::GetProcessById([int]$占用进程ID)
+            写启动器日志 "启动前清理残留端口占用: 端口=$目标端口 PID=$占用进程ID 进程=$($占用进程.ProcessName)"
+            $占用进程.Kill()
+            $占用进程.WaitForExit()
+        } catch {
+            写启动器日志 "启动前清理残留端口占用失败: 端口=$目标端口 PID=$占用进程ID 错误=$($_.Exception.Message)"
+            throw
+        }
+    }
+}
+
+function 启动调试服务器后台子进程 {
+    if (Test-Path $后台启动日志) { Remove-Item $后台启动日志 -Force -ErrorAction SilentlyContinue }
+    写启动器日志 "准备启动后台调试服务器: 端口=$端口 监视=$([bool]$监视) 仅本机=$([bool]$仅本机)"
+
+    清理启动器残留端口 $端口
+
+    $参数列表 = @(
+        "-NoProfile",
+        "-ExecutionPolicy", "Bypass",
+        "-File", ('"' + $脚本路径 + '"'),
+        "-端口", [string]$端口,
+        "-内部后台进程"
+    )
+
+    if ($监视) { $参数列表 += "-监视" }
+    if ($仅本机) { $参数列表 += "-仅本机" }
+
+    $启动进程 = Start-Process -FilePath "powershell.exe" -ArgumentList $参数列表 -WindowStyle Hidden -PassThru
+    写启动器日志 "后台子进程已创建: PID=$($启动进程.Id)"
+    $目标主机 = if ($仅本机) { "127.0.0.1" } else { "127.0.0.1" }
+
+    for ($i = 0; $i -lt 40; $i++) {
+        Start-Sleep -Milliseconds 250
+        if ($启动进程.HasExited) {
+            写启动器日志 "后台子进程启动失败: PID=$($启动进程.Id) ExitCode=$($启动进程.ExitCode)"
+            throw "调试服务器后台进程启动后立即退出，退出码: $($启动进程.ExitCode)"
+        }
+        if (测试端口可连接 -主机 $目标主机 -目标端口 $端口 -超时毫秒 200) {
+            写启动器日志 "后台调试服务器已就绪: PID=$($启动进程.Id) 端口=$端口"
+            Write-Host "调试服务器已转入后台运行，PID=$($启动进程.Id)，端口=$端口" -ForegroundColor Green
+            Write-Host "运行日志: $后台启动日志" -ForegroundColor DarkGray
+            return
+        }
+    }
+
+    写启动器日志 "后台调试服务器启动超时: PID=$($启动进程.Id) 端口=$端口"
+    throw "调试服务器后台进程已启动，但在限定时间内未监听端口 $端口"
+}
+
+if (-not $前台 -and -not $内部后台进程) {
+    启动调试服务器后台子进程
+    return
+}
+
+# ─── 日志文件 ─────────────────────────────────────────────────────────
+$证书目录 = Join-Path $PSScriptRoot "certs"
+if (-not (Test-Path $证书目录)) { New-Item -ItemType Directory -Path $证书目录 -Force | Out-Null }
+$日志文件 = Join-Path $日志目录 "调试服务器-运行时.log"
+$调试证书Pfx路径 = Join-Path $证书目录 "调试服务器.pfx"
+$调试证书Cer路径 = Join-Path $证书目录 "调试服务器.cer"
+$调试证书元数据路径 = Join-Path $日志目录 "调试服务器-metadata.json"
+$调试证书密码明文 = "Acode-Debug-Tls"
+if (Test-Path $日志文件) { Remove-Item $日志文件 -Force -ErrorAction SilentlyContinue }
+
+function 追加调试日志 {
+    param(
+        [string]$消息
+    )
+
+    $时间戳 = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    [System.IO.File]::AppendAllText(
+        $日志文件,
+        "$时间戳 $消息`r`n",
+        [System.Text.UTF8Encoding]::new($false)
+    )
+}
+
+function 写调试日志 {
+    param(
+        [string]$消息,
+        [string]$颜色 = "White",
+        [switch]$不换行
+    )
+
+    追加调试日志 $消息
+    if ($不换行) {
+        Write-Host $消息 -ForegroundColor $颜色 -NoNewline
+    } else {
+        Write-Host $消息 -ForegroundColor $颜色
+    }
+}
+
+# ─── 局域网 IP ───────────────────────────────────────────────────────
+function 获取局域网IP {
+    $候选 = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
+        $_.PrefixOrigin -ne "WellKnown" -and
+        $_.IPAddress -notmatch '^169\.254\.' -and
+        $_.IPAddress -ne '127.0.0.1' -and
+        $_.InterfaceAlias -notmatch 'Loopback|vEthernet|Hyper-V|WSL|VirtualBox|VMware|isatap|Teredo|Bluetooth|本地连接\*'
+    }
+    # 优先 WLAN/Wi-Fi/以太网等实际物理网卡（DHCP 分配的地址）
+    $内网 = $候选 | Where-Object {
+        $_.InterfaceAlias -match 'WLAN|Wi-Fi|以太网|Ethernet' -and $_.PrefixOrigin -eq 'Dhcp'
+    } | Select-Object -First 1
+    if ($内网) { return $内网.IPAddress }
+    # fallback：任意 DHCP 私有 IP
+    $内网 = $候选 | Where-Object {
+        $_.PrefixOrigin -eq 'Dhcp' -and (
+            $_.IPAddress -match '^192\.168\.' -or $_.IPAddress -match '^10\.' -or
+            $_.IPAddress -match '^172\.(1[6-9]|2[0-9]|3[0-1])\.'
+        )
+    } | Select-Object -First 1
+    if ($内网) { return $内网.IPAddress }
+    $任意 = $候选 | Select-Object -First 1
+    if ($任意) { return $任意.IPAddress }
+    return "127.0.0.1"
+}
+
+# ─── 清理端口占用 ────────────────────────────────────────────────────
+function 清理端口占用([int]$目标端口) {
+    $连接 = Get-NetTCPConnection -LocalPort $目标端口 -ErrorAction SilentlyContinue
+    if (-not $连接) { return }
+    foreach ($进程ID in ($连接 | Select-Object -ExpandProperty OwningProcess -Unique)) {
+        if ($进程ID -and $进程ID -gt 4 -and $进程ID -ne $PID) {
+            try {
+                Stop-Process -Id $进程ID -Force -ErrorAction Stop
+                写调试日志 "  ⚠ 已终止占用端口 $目标端口 的进程 PID=$进程ID" Yellow
+            } catch {}
+        }
+    }
+}
+
+# ─── 防火墙 ──────────────────────────────────────────────────────────
+function 配置防火墙([int]$目标端口) {
+    $规则名 = "Acode-调试-$目标端口"
+    try {
+        $输出 = & netsh advfirewall firewall show rule name="$规则名" 2>&1
+        if (($输出 -join "`n") -match "No rules match|没有与指定条件匹配的规则") {
+            & netsh advfirewall firewall add rule name="$规则名" dir=in action=allow protocol=TCP localport=$目标端口 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                写调试日志 "  ✓ 已添加防火墙入站规则: TCP/$目标端口" Green
+            }
+        }
+    } catch {}
+}
+
+function 获取调试证书元数据 {
+    if (-not (Test-Path $调试证书元数据路径)) {
+        return $null
+    }
+
+    try {
+        return Get-Content $调试证书元数据路径 -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        return $null
+    }
+}
+
+function 加载调试服务器证书 {
+    if (-not (Test-Path $调试证书Pfx路径)) {
+        return $null
+    }
+
+    $标志 = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable -bor
+        [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::PersistKeySet
+    return [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+        $调试证书Pfx路径,
+        $调试证书密码明文,
+        $标志
+    )
+}
+
+function 生成调试服务器证书([string]$主机IP) {
+    if (Test-Path $调试证书Pfx路径) { Remove-Item $调试证书Pfx路径 -Force }
+    if (Test-Path $调试证书Cer路径) { Remove-Item $调试证书Cer路径 -Force }
+
+    $rsa = [System.Security.Cryptography.RSA]::Create(2048)
+    try {
+        $请求 = [System.Security.Cryptography.X509Certificates.CertificateRequest]::new(
+            "CN=Acode Debug Server",
+            $rsa,
+            [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+            [System.Security.Cryptography.RSASignaturePadding]::Pkcs1
+        )
+
+        $SAN = [System.Security.Cryptography.X509Certificates.SubjectAlternativeNameBuilder]::new()
+        $SAN.AddDnsName("localhost")
+        $SAN.AddIpAddress([System.Net.IPAddress]::Parse("127.0.0.1"))
+        $SAN.AddIpAddress([System.Net.IPAddress]::Parse($主机IP))
+
         $请求.CertificateExtensions.Add($SAN.Build())
         $请求.CertificateExtensions.Add(
             [System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension]::new($false, $false, 0, $false)
