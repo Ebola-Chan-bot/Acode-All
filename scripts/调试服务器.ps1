@@ -481,11 +481,6 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
         send(payload);
     };
     function hookScriptLifecycle(){
-        document.addEventListener("load",function(event){
-            var target=event&&event.target;
-            if(!target||target.tagName!=="SCRIPT")return;
-            send({type:"console",level:"debug",args:["[script-load]",target.src||"[inline]"],timestamp:Date.now()});
-        },true);
         document.addEventListener("error",function(event){
             var target=event&&event.target;
             if(!target||target.tagName!=="SCRIPT")return;
