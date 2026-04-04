@@ -140,6 +140,31 @@ function 检查命令($命令, $提示) {
     }
 }
 
+# 通用 winget 安装辅助函数：检测命令是否存在，不存在则通过 winget 安装。
+# 安装后自动刷新 PATH，并尝试 winget Links 目录作为后备。
+function 确保命令可用([string]$命令名, [string]$winget包ID, [string]$说明) {
+    if (Get-Command $命令名 -ErrorAction SilentlyContinue) { return }
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "User") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+    if (Get-Command $命令名 -ErrorAction SilentlyContinue) { return }
+    输出步骤 "安装 $命令名（$说明）"
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        输出错误 "找不到 $命令名 且 winget 不可用，请手动安装: winget install $winget包ID"
+        exit 1
+    }
+    winget install $winget包ID --accept-source-agreements --accept-package-agreements --silent 2>&1 | ForEach-Object { Write-Host "  $_" }
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "User") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+    if (-not (Get-Command $命令名 -ErrorAction SilentlyContinue)) {
+        $链接路径 = "$env:LOCALAPPDATA\Microsoft\WinGet\Links\$命令名.exe"
+        if (Test-Path $链接路径) {
+            $env:Path = "$env:LOCALAPPDATA\Microsoft\WinGet\Links;$env:Path"
+        } else {
+            输出错误 "$命令名 安装后仍不可用，请重启终端后重试"
+            exit 1
+        }
+    }
+    输出成功 "$命令名 已自动安装"
+}
+
 function 执行外部命令并输出 {
     param(
         [Parameter(Mandatory)]
@@ -703,13 +728,16 @@ function 验证源码未被修改 {
 function 初始化构建环境 {
     输出步骤 "检测构建环境"
 
-    检查命令 "git" "请安装 Git: https://git-scm.com/"
+    确保命令可用 "git" "Git.Git" "版本控制"
     输出成功 "Git: $(git --version)"
 
-    检查命令 "node" "请安装 Node.js: https://nodejs.org/"
+    确保命令可用 "node" "OpenJS.NodeJS" "JavaScript 运行时"
     输出成功 "Node.js: $(node --version)"
 
-    检查命令 "npm" "请安装 npm（随 Node.js 安装）"
+    if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+        输出错误 "npm 未随 Node.js 安装，请检查 Node.js 安装是否完整"
+        exit 1
+    }
     输出成功 "npm: $(npm --version)"
 
     if (-not $env:JAVA_HOME -or -not (Test-Path (Join-Path $env:JAVA_HOME 'bin/javac.exe'))) {
@@ -726,9 +754,16 @@ function 初始化构建环境 {
             $env:JAVA_HOME = (Split-Path (Split-Path $Javac路径.FullName))
             输出成功 "自动检测 JAVA_HOME: $env:JAVA_HOME"
         } else {
-            输出错误 "找不到 JDK，请安装 JDK 17+ 或设置 JAVA_HOME"
-            输出错误 "推荐: https://adoptium.net/"
-            exit 1
+            输出步骤 "安装 JDK 21（Android 构建所需）"
+            确保命令可用 "javac" "EclipseAdoptium.Temurin.21.JDK" "Java 编译器"
+            $Javac路径 = Get-Command javac -ErrorAction SilentlyContinue
+            if ($Javac路径) {
+                $env:JAVA_HOME = (Split-Path (Split-Path $Javac路径.Source))
+                输出成功 "自动安装 JAVA_HOME: $env:JAVA_HOME"
+            } else {
+                输出错误 "JDK 安装后仍找不到 javac"
+                exit 1
+            }
         }
     } else {
         输出成功 "JAVA_HOME: $env:JAVA_HOME"
@@ -850,11 +885,18 @@ function 初始化构建环境 {
             $env:PATH = "$Cargo二进制目录;$env:PATH"
             输出成功 "已将 $Cargo二进制目录 添加到 PATH"
         } else {
-            输出错误 "找不到 'rustup'，请安装 Rust: https://rustup.rs/"
-            exit 1
+            输出步骤 "安装 Rust（acodex-server 编译所需）"
+            确保命令可用 "rustup" "Rustlang.Rustup" "Rust 工具链管理器"
+            $Cargo二进制目录 = Join-Path $env:USERPROFILE ".cargo\bin"
+            if (Test-Path $Cargo二进制目录) {
+                $env:PATH = "$Cargo二进制目录;$env:PATH"
+            }
         }
     }
-    检查命令 "cargo" "请安装 Rust: https://rustup.rs/"
+    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+        输出错误 "cargo 仍不可用，请重启终端后重试"
+        exit 1
+    }
     输出成功 "Rust: $(rustc --version)"
 
     $script:Zig路径 = $null
@@ -1864,41 +1906,6 @@ function 还原AcodexServer终端诊断注入 {
 
 # ─── 交叉编译 proot ──────────────────────────────────────────────────
 
-# proot 源文件列表从 GNUmakefile 的 OBJECTS 变量动态解析，避免硬编码。
-# 不直接调用 make 的原因：
-# 1. NDK 路径含空格和括号（Program Files (x86)），make 的 $(shell ...) 通过 sh 执行会语法错误
-# 2. GNUmakefile 的 $(SRC)$< 在 out-of-tree 构建时把 VPATH 解析后的绝对路径拼重
-# 3. 32 位 loader 用 $(CC) -m32 编译，是 GCC 特有语法，NDK clang 需要单独的 armv7 编译器
-# 4. NDK 的 .cmd 包装器在 POSIX sh 中不可靠
-function 解析Proot源文件列表 {
-    $Makefile路径 = Join-Path $Proot源码根目录 "src/GNUmakefile"
-    if (-not (Test-Path $Makefile路径 -PathType Leaf)) {
-        输出错误 "找不到 proot GNUmakefile: $Makefile路径"
-        exit 1
-    }
-
-    $内容 = Get-Content $Makefile路径 -Raw -Encoding UTF8
-
-    # 提取 OBJECTS += ... 多行连续块（以 \ 续行）
-    if ($内容 -notmatch '(?ms)OBJECTS\s*\+=\s*((?:[^\n]*\\\s*\n)*[^\n]*)') {
-        输出错误 "无法从 GNUmakefile 解析 OBJECTS 变量"
-        exit 1
-    }
-
-    $对象块 = $Matches[1]
-    $源文件列表 = [System.Collections.Generic.List[string]]::new()
-    foreach ($匹配 in [regex]::Matches($对象块, '(\S+)\.o')) {
-        $源文件列表.Add($匹配.Groups[1].Value)
-    }
-
-    if ($源文件列表.Count -eq 0) {
-        输出错误 "GNUmakefile 中未找到任何 OBJECTS 条目"
-        exit 1
-    }
-
-    return @($源文件列表)
-}
-
 function 准备Talloc头文件 {
     $Talloc缓存目录 = Join-Path $构建缓存目录 "talloc-headers"
     $TallocH路径 = Join-Path $Talloc缓存目录 "talloc.h"
@@ -1993,16 +2000,14 @@ function 编译Proot单架构 {
     # make 的 $(shell) 通过 SHELL 指定的程序执行命令。
     # 路径含空格或括号（如 "Program Files (x86)"）会导致 sh 语法错误，
     # 因此所有传给 make 的路径必须先转为 Windows 8.3 短路径格式。
+    确保命令可用 "git" "Git.Git" "proot 编译需要 POSIX shell (sh.exe)"
     $SH路径 = "C:\Program Files\Git\bin\sh.exe"
     if (-not (Test-Path $SH路径)) {
-        输出错误 "找不到 Git Bash (sh.exe)，proot 编译需要 POSIX shell"
+        输出错误 "Git 已安装但 sh.exe 不在预期位置: $SH路径"
         exit 1
     }
+    确保命令可用 "make" "ezwinports.make" "proot 编译所需"
     $MAKE路径 = (Get-Command make -ErrorAction SilentlyContinue).Source
-    if (-not $MAKE路径) {
-        输出错误 "找不到 make，请安装 ezwinports make 或其他 GNU Make"
-        exit 1
-    }
 
     # 将含空格/括号的路径转为 8.3 短路径；make $(shell) 中的 sh 无法处理这类路径。
     function 获取短路径([string]$路径) {
@@ -2032,28 +2037,13 @@ function 编译Proot单架构 {
     $短Sysroot = 获取短路径 $Sysroot路径
 
     # 从 .cmd 包装器文件名中提取 --target 值。
-    # 例如 "aarch64-linux-android28-clang.cmd" → "--target=aarch64-linux-android28"
+    # 例如 "aarch64-linux-android28-clang.cmd" → "aarch64-linux-android28"
     $CC文件名 = [System.IO.Path]::GetFileNameWithoutExtension($CC路径) -replace '-clang$', ''
     $CC32文件名 = [System.IO.Path]::GetFileNameWithoutExtension($CC32路径) -replace '-clang$', ''
 
-    # 创建 shell 包装器脚本，将 clang.exe + --target + --sysroot 打包为单一可执行文件。
-    # make 的 CC 变量不能含空格（否则 $(shell $(CC) ...) 会解析错误），
-    # 但 NDK clang 必须同时传 --target 和 --sysroot。
-    # 包装器脚本绕过了这个限制。
-    $CC包装器 = Join-Path $构建目录 "cc-wrapper.sh"
-    $CC32包装器 = Join-Path $构建目录 "cc32-wrapper.sh"
-
-    # 路径用正斜杠（bash 脚本）
-    $clangUnix = $短CC -replace '\\', '/'
-    $clang32Unix = $短CC32 -replace '\\', '/'
-    $sysrootUnix = $短Sysroot -replace '\\', '/'
-
-    [System.IO.File]::WriteAllText($CC包装器,
-        "#!/bin/sh`nexec `"$clangUnix`" --target=$CC文件名 --sysroot=`"$sysrootUnix`" `"`$@`"`n",
-        [System.Text.UTF8Encoding]::new($false))
-    [System.IO.File]::WriteAllText($CC32包装器,
-        "#!/bin/sh`nexec `"$clang32Unix`" --target=$CC32文件名 --sysroot=`"$sysrootUnix`" `"`$@`"`n",
-        [System.Text.UTF8Encoding]::new($false))
+    # GNUmakefile 的 CC_TARGET/CC_SYSROOT 机制把 --target 和 --sysroot
+    # 作为独立的 make 变量传入，由 GNUmakefile 负责拼接到编译和链接命令中。
+    # 这样 CC 变量可以是简单的 clang.exe 路径，不需要 wrapper 脚本。
 
     $PROOT_UNBUNDLE_LOADER = "/data/data/com.foxdebug.acode/files"
 
@@ -2073,12 +2063,17 @@ function 编译Proot单架构 {
     $unixMAKE       = Win路径转Unix $MAKE路径
     $unixMakefile   = Win路径转Unix $GNUmakefile路径
     $unixBuildDir   = Win路径转Unix $构建目录
+    $unixCC         = Win路径转Unix $短CC
+    $unixCC32       = Win路径转Unix $短CC32
+    $unixSysroot    = Win路径转Unix $短Sysroot
     $unixSTRIP      = Win路径转Unix (获取短路径 $STRIP路径)
     $unixREADELF    = Win路径转Unix (获取短路径 $READELF路径)
     $unixOBJCOPY    = Win路径转Unix (获取短路径 $OBJCOPY路径)
     $unixOBJDUMP    = Win路径转Unix (获取短路径 $OBJDUMP路径)
     $unixTallocInc  = Win路径转Unix (获取短路径 $Talloc头文件目录)
-    $unixTallocLib  = Win路径转Unix (获取短路径 $Talloc库目录)
+    # ld.lld 是 Windows 原生二进制，不理解 MSYS2 格式 (/c/...)，
+    # 所以 LDFLAGS 的 -L 路径必须用 Windows 格式 (C:/...)。
+    $winTallocLib   = (获取短路径 $Talloc库目录) -replace '\\','/'
     # VPATH/SRC 指向源文件目录；命令行传入 CPPFLAGS 会覆盖 GNUmakefile 中的
     # CPPFLAGS += -I$(VPATH)，所以必须在此处显式包含源文件目录。
     $unixSrcDir     = Win路径转Unix (Join-Path $Proot源码根目录 "src")
@@ -2105,26 +2100,11 @@ function 编译Proot单架构 {
         default { '0x20000000' }  # 32-bit ARM as fallback
     }
 
-    # ── 预生成 build.h ──
-    # build.h 由 GNUmakefile 的 auto-configuration 生成：编译 .check_* 测试程序
-    # 然后执行它们来探测宿主系统特性（process_vm, seccomp_filter）。
-    # 但交叉编译时测试程序无法在 Windows 上执行，$(shell egrep ...) 探测
-    # 哪些源文件依赖 build.h 也会失败（USE_BUILD_H 为空），导致 build.h
-    # 永远不会被生成。直接预生成，包含目标平台已知的特性定义。
-    # Android aarch64 API 28+ 支持 process_vm 和 seccomp_filter。
+    # ── 获取版本号 ──
+    # 传给 make 的 VERSION 变量，由 GNUmakefile 写入 build.h，
+    # 跳过 $(GIT) describe 的 $(shell) 调用。
     $version = & git -C $Proot源码根目录 describe --tags --dirty --abbrev=8 --always 2>$null
     if (-not $version) { $version = "unknown" }
-    $buildH路径 = Join-Path $构建目录 "build.h"
-    [System.IO.File]::WriteAllText($buildH路径, @"
-/* Auto-generated for cross-compilation to Android aarch64. */
-#ifndef BUILD_H
-#define BUILD_H
-#undef VERSION
-#define VERSION "$version"
-#define HAVE_PROCESS_VM
-#define HAVE_SECCOMP_FILTER
-#endif /* BUILD_H */
-"@, [System.Text.UTF8Encoding]::new($false))
 
     $buildScript路径 = Join-Path $构建目录 "run-make.sh"
     $buildScriptContent = @"
@@ -2139,8 +2119,11 @@ exec "$unixMAKE" \
   -j$([Environment]::ProcessorCount) \
   V=1 \
   "SHELL=$winSH" \
-  CC=./cc-wrapper.sh \
-  CC32=./cc32-wrapper.sh \
+  CC="$unixCC" \
+  CC_TARGET=$CC文件名 \
+  CC32="$unixCC32" \
+  CC32_TARGET=$CC32文件名 \
+  CC_SYSROOT="$unixSysroot" \
   CC32_FLAG= \
   STRIP="$unixSTRIP" \
   READELF="$unixREADELF" \
@@ -2152,9 +2135,12 @@ exec "$unixMAKE" \
   LOADER_ADDRESS=$loaderAddress \
   LOADER_ADDRESS-m32=$loader32Address \
   "BUILD_ID_NONE=,--build-id=none" \
+  "VERSION=$version" \
+  HAVE_PROCESS_VM=1 \
+  HAVE_SECCOMP_FILTER=1 \
   "USE_BUILD_H=cli/cli.o cli/proot.o execve/aoxp.o extension/extension.o path/path.o syscall/seccomp.o tracee/mem.o" \
   "CPPFLAGS=-D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -I. -I$unixSrcDir -I$unixTallocInc -DARG_MAX=131072 -Wno-error=implicit-function-declaration" \
-  "LDFLAGS=-L$unixTallocLib -ltalloc -Wl,-z,noexecstack"
+  "LDFLAGS=-L$winTallocLib -ltalloc -Wl,-z,noexecstack"
 "@
     [System.IO.File]::WriteAllText($buildScript路径, $buildScriptContent,
         [System.Text.UTF8Encoding]::new($false))
