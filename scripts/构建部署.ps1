@@ -17,6 +17,7 @@
     full         = 完整流程（首次使用推荐）
     setup        = 仅初始化环境和依赖
     build-server = 仅编译 acodex-server
+    build-proot  = 仅编译 proot（交叉编译 → Android）
     build-apk    = 仅构建 APK（仅在使用调试服务器 AXS 下载源时会自动补编译）
     deploy       = 仅推送已构建的 APK 到手机
     clean        = 清理构建产物
@@ -53,7 +54,7 @@
 #>
 
 param(
-    [ValidateSet("full", "setup", "build-server", "build-apk", "deploy", "clean")]
+    [ValidateSet("full", "setup", "build-server", "build-proot", "build-apk", "deploy", "clean")]
     [string]$动作 = "full",
 
     [ValidateSet("adb", "hdc")]
@@ -102,6 +103,7 @@ if ($构建模式 -eq "release") {
 $工作区根目录     = Resolve-Path (Join-Path $PSScriptRoot "..")
 $Acode源码根目录  = Join-Path $工作区根目录 "Acode"
 $Acodex根目录     = Join-Path $工作区根目录 "acodex-server"
+$Proot源码根目录  = Join-Path $工作区根目录 "proot"
 $HDC程序路径      = "C:\Program Files (x86)\HiSuite\hwtools\hdc.exe"
 $构建缓存目录     = Join-Path $工作区根目录 "scripts/logs/.build-cache"
 $构建缓存文件路径 = Join-Path $构建缓存目录 "state.json"
@@ -1025,17 +1027,19 @@ function 查找NDK工具链 {
 }
 
 # ─── 子模块 URL 配置 ──────────────────────────────────────────────────
-$子模块名称列表 = @("Acode", "acodex-server", "acode-plugin-github")
+$子模块名称列表 = @("Acode", "acodex-server", "acode-plugin-github", "proot")
 $子模块校验文件 = @{
     "Acode"               = "package.json"
     "acodex-server"       = "Cargo.toml"
     "acode-plugin-github" = "package.json"
+    "proot"               = "src/GNUmakefile"
 }
 
 $子模块原始URL = @{
     "Acode"               = "https://github.com/Ebola-Chan-bot/Acode.git"
     "acode-plugin-github" = "https://github.com/Ebola-Chan-bot/acode-plugin-github.git"
     "acodex-server"       = "https://github.com/Ebola-Chan-bot/acodex_server.git"
+    "proot"               = "https://github.com/termux/proot.git"
 }
 
 $镜像前缀列表 = @(
@@ -1858,6 +1862,400 @@ function 还原AcodexServer终端诊断注入 {
     return
 }
 
+# ─── 交叉编译 proot ──────────────────────────────────────────────────
+
+# proot 源文件列表从 GNUmakefile 的 OBJECTS 变量动态解析，避免硬编码。
+# 不直接调用 make 的原因：
+# 1. NDK 路径含空格和括号（Program Files (x86)），make 的 $(shell ...) 通过 sh 执行会语法错误
+# 2. GNUmakefile 的 $(SRC)$< 在 out-of-tree 构建时把 VPATH 解析后的绝对路径拼重
+# 3. 32 位 loader 用 $(CC) -m32 编译，是 GCC 特有语法，NDK clang 需要单独的 armv7 编译器
+# 4. NDK 的 .cmd 包装器在 POSIX sh 中不可靠
+function 解析Proot源文件列表 {
+    $Makefile路径 = Join-Path $Proot源码根目录 "src/GNUmakefile"
+    if (-not (Test-Path $Makefile路径 -PathType Leaf)) {
+        输出错误 "找不到 proot GNUmakefile: $Makefile路径"
+        exit 1
+    }
+
+    $内容 = Get-Content $Makefile路径 -Raw -Encoding UTF8
+
+    # 提取 OBJECTS += ... 多行连续块（以 \ 续行）
+    if ($内容 -notmatch '(?ms)OBJECTS\s*\+=\s*((?:[^\n]*\\\s*\n)*[^\n]*)') {
+        输出错误 "无法从 GNUmakefile 解析 OBJECTS 变量"
+        exit 1
+    }
+
+    $对象块 = $Matches[1]
+    $源文件列表 = [System.Collections.Generic.List[string]]::new()
+    foreach ($匹配 in [regex]::Matches($对象块, '(\S+)\.o')) {
+        $源文件列表.Add($匹配.Groups[1].Value)
+    }
+
+    if ($源文件列表.Count -eq 0) {
+        输出错误 "GNUmakefile 中未找到任何 OBJECTS 条目"
+        exit 1
+    }
+
+    return @($源文件列表)
+}
+
+function 准备Talloc头文件 {
+    $Talloc缓存目录 = Join-Path $构建缓存目录 "talloc-headers"
+    $TallocH路径 = Join-Path $Talloc缓存目录 "talloc.h"
+
+    if (Test-Path $TallocH路径 -PathType Leaf) {
+        return $Talloc缓存目录
+    }
+
+    输出步骤 "下载 talloc.h 头文件"
+    New-Item -ItemType Directory -Path $Talloc缓存目录 -Force | Out-Null
+
+    # talloc（Samba 项目子库）的 API 非常稳定，不需要版本精确匹配。
+    # 下载单文件 talloc.h 用于编译 proot；运行时链接的 libtalloc.so 由
+    # Acode 预打包的 Cordova 插件提供。
+    $URL列表 = @(
+        "https://raw.githubusercontent.com/samba-team/samba/master/lib/talloc/talloc.h",
+        "https://gitlab.com/samba-team/devel/samba/-/raw/master/lib/talloc/talloc.h"
+    )
+
+    foreach ($URL in $URL列表) {
+        try {
+            Invoke-WebRequest -Uri $URL -OutFile $TallocH路径 -UseBasicParsing -ErrorAction Stop
+            if ((Test-Path $TallocH路径) -and (Get-Item $TallocH路径).Length -gt 1000) {
+                输出成功 "talloc.h 已下载: $URL"
+                return $Talloc缓存目录
+            }
+        } catch {
+            输出警告 "下载失败: $URL"
+        }
+    }
+
+    输出错误 "无法下载 talloc.h，请检查网络连接"
+    exit 1
+}
+
+function 获取Proot源码签名 {
+    $Proot源码Src = Join-Path $Proot源码根目录 "src"
+    if (-not (Test-Path (Join-Path $Proot源码Src "GNUmakefile"))) {
+        return $null
+    }
+
+    return 获取签名摘要 (获取路径签名 @($Proot源码Src))
+}
+
+function 获取Proot编译状态 {
+    param([string]$架构名称)
+
+    $当前签名 = 获取Proot源码签名
+    if ($null -eq $当前签名) {
+        return @{ 需要编译 = $false; 原因 = "proot 子模块不存在"; 可用 = $false }
+    }
+
+    $缓存键 = "proot|$架构名称"
+    $缓存签名 = 获取构建缓存值 $缓存键
+    $产物目录 = Join-Path $构建缓存目录 "proot-build/$架构名称"
+    $Proot产物 = Join-Path $产物目录 "proot"
+    $Loader产物 = Join-Path $产物目录 "loader/loader"
+
+    if (-not (Test-Path $Proot产物) -or -not (Test-Path $Loader产物)) {
+        return @{ 需要编译 = $true; 原因 = "未检测到编译产物"; 当前签名 = $当前签名; 可用 = $true }
+    }
+
+    if ($缓存签名 -ne $当前签名) {
+        $原因 = if ([string]::IsNullOrWhiteSpace([string]$缓存签名)) { "缺少编译签名缓存" } else { "检测到源码变更" }
+        return @{ 需要编译 = $true; 原因 = $原因; 当前签名 = $当前签名; 可用 = $true }
+    }
+
+    return @{ 需要编译 = $false; 当前签名 = $当前签名; 可用 = $true }
+}
+
+function 编译Proot单架构 {
+    param(
+        [string]$架构名称,
+        [string]$CC路径,
+        [string]$CC32路径,
+        [string]$STRIP路径,
+        [string]$READELF路径,
+        [string]$OBJCOPY路径,
+        [string]$OBJDUMP路径,
+        [string]$Talloc头文件目录,
+        [string]$Talloc库目录
+    )
+
+    $Proot源码Src = Join-Path $Proot源码根目录 "src"
+    $GNUmakefile路径 = Join-Path $Proot源码Src "GNUmakefile"
+    $构建目录 = Join-Path $构建缓存目录 "proot-build/$架构名称"
+
+    # 清空旧构建产物后重建目录
+    if (Test-Path $构建目录) { Remove-Item $构建目录 -Recurse -Force }
+    New-Item -ItemType Directory -Path $构建目录 -Force | Out-Null
+
+    # make 的 $(shell) 通过 SHELL 指定的程序执行命令。
+    # 路径含空格或括号（如 "Program Files (x86)"）会导致 sh 语法错误，
+    # 因此所有传给 make 的路径必须先转为 Windows 8.3 短路径格式。
+    $SH路径 = "C:\Program Files\Git\bin\sh.exe"
+    if (-not (Test-Path $SH路径)) {
+        输出错误 "找不到 Git Bash (sh.exe)，proot 编译需要 POSIX shell"
+        exit 1
+    }
+    $MAKE路径 = (Get-Command make -ErrorAction SilentlyContinue).Source
+    if (-not $MAKE路径) {
+        输出错误 "找不到 make，请安装 ezwinports make 或其他 GNU Make"
+        exit 1
+    }
+
+    # 将含空格/括号的路径转为 8.3 短路径；make $(shell) 中的 sh 无法处理这类路径。
+    function 获取短路径([string]$路径) {
+        $output = cmd /c "for %I in (`"$路径`") do @echo %~sI" 2>&1
+        $短路径 = ($output | Select-Object -First 1).Trim()
+        if ([string]::IsNullOrWhiteSpace($短路径) -or -not (Test-Path $短路径)) {
+            输出错误 "无法获取短路径: $路径"
+            exit 1
+        }
+        return $短路径 -replace '\\', '/'
+    }
+
+    $短CC       = 获取短路径 $CC路径
+    $短CC32     = 获取短路径 $CC32路径
+    $短STRIP    = 获取短路径 $STRIP路径
+    $短READELF  = 获取短路径 $READELF路径
+    $短OBJCOPY  = 获取短路径 $OBJCOPY路径
+    $短OBJDUMP  = 获取短路径 $OBJDUMP路径
+    $短SH       = 获取短路径 $SH路径
+    $短Talloc头 = 获取短路径 $Talloc头文件目录
+    $短Talloc库 = 获取短路径 $Talloc库目录
+
+    # NDK clang.exe 本身支持 --target 和 --sysroot，不需要 .cmd 包装器。
+    # 查找 sysroot 路径（CC 所在 bin 目录的同级 sysroot）。
+    $工具链根 = Split-Path (Split-Path $CC路径)
+    $Sysroot路径 = Join-Path $工具链根 "sysroot"
+    $短Sysroot = 获取短路径 $Sysroot路径
+
+    # 从 .cmd 包装器文件名中提取 --target 值。
+    # 例如 "aarch64-linux-android28-clang.cmd" → "--target=aarch64-linux-android28"
+    $CC文件名 = [System.IO.Path]::GetFileNameWithoutExtension($CC路径) -replace '-clang$', ''
+    $CC32文件名 = [System.IO.Path]::GetFileNameWithoutExtension($CC32路径) -replace '-clang$', ''
+
+    # 创建 shell 包装器脚本，将 clang.exe + --target + --sysroot 打包为单一可执行文件。
+    # make 的 CC 变量不能含空格（否则 $(shell $(CC) ...) 会解析错误），
+    # 但 NDK clang 必须同时传 --target 和 --sysroot。
+    # 包装器脚本绕过了这个限制。
+    $CC包装器 = Join-Path $构建目录 "cc-wrapper.sh"
+    $CC32包装器 = Join-Path $构建目录 "cc32-wrapper.sh"
+
+    # 路径用正斜杠（bash 脚本）
+    $clangUnix = $短CC -replace '\\', '/'
+    $clang32Unix = $短CC32 -replace '\\', '/'
+    $sysrootUnix = $短Sysroot -replace '\\', '/'
+
+    [System.IO.File]::WriteAllText($CC包装器,
+        "#!/bin/sh`nexec `"$clangUnix`" --target=$CC文件名 --sysroot=`"$sysrootUnix`" `"`$@`"`n",
+        [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText($CC32包装器,
+        "#!/bin/sh`nexec `"$clang32Unix`" --target=$CC32文件名 --sysroot=`"$sysrootUnix`" `"`$@`"`n",
+        [System.Text.UTF8Encoding]::new($false))
+
+    $PROOT_UNBUNDLE_LOADER = "/data/data/com.foxdebug.acode/files"
+
+    # ── 生成构建脚本 ──
+    # 必须在 Git Bash 中运行 make，而不是从 PowerShell 直接调用 ezwinports make。
+    # 原因：ezwinports make 是原生 Windows 程序，MAKEFILE_LIST 中的路径使用反斜杠，
+    # $(shell ...) 使用 cmd.exe 而非 SHELL，导致 POSIX 工具（mkdir -p, egrep 等）
+    # 和路径中的反斜杠转义全部失败。在 bash 中运行则所有路径自动为 POSIX 格式。
+    function Win路径转Unix([string]$路径) {
+        $路径 = $路径 -replace '\\', '/'
+        if ($路径 -match '^([A-Za-z]):(.*)$') {
+            return "/" + $Matches[1].ToLower() + $Matches[2]
+        }
+        return $路径
+    }
+
+    $unixMAKE       = Win路径转Unix $MAKE路径
+    $unixMakefile   = Win路径转Unix $GNUmakefile路径
+    $unixBuildDir   = Win路径转Unix $构建目录
+    $unixSTRIP      = Win路径转Unix (获取短路径 $STRIP路径)
+    $unixREADELF    = Win路径转Unix (获取短路径 $READELF路径)
+    $unixOBJCOPY    = Win路径转Unix (获取短路径 $OBJCOPY路径)
+    $unixOBJDUMP    = Win路径转Unix (获取短路径 $OBJDUMP路径)
+    $unixTallocInc  = Win路径转Unix (获取短路径 $Talloc头文件目录)
+    $unixTallocLib  = Win路径转Unix (获取短路径 $Talloc库目录)
+    # VPATH/SRC 指向源文件目录；命令行传入 CPPFLAGS 会覆盖 GNUmakefile 中的
+    # CPPFLAGS += -I$(VPATH)，所以必须在此处显式包含源文件目录。
+    $unixSrcDir     = Win路径转Unix (Join-Path $Proot源码根目录 "src")
+    # 设置 SHELL 为 Git Bash 的 sh.exe，使得 make 的 $(shell ...) 和 recipe
+    # 都使用 POSIX shell 而非 cmd.exe。ezwinports make 作为原生 Windows 程序，
+    # 默认使用 cmd.exe 执行 $(shell ...)，导致 grep/egrep/tr 等 POSIX 工具不可用。
+    # 注意：SHELL 必须用 Windows 格式路径（C:/...），不能用 Unix 格式（/c/...），
+    # 因为 ezwinports make 是原生 Windows 程序，不认识 /c/ 前缀。
+    $winSH          = $短SH  # 已由 获取短路径 转为正斜杠的 8.3 短路径，如 C:/PROGRA~1/Git/bin/sh.exe
+
+    # 确定目标架构的 loader 地址。这些值来自 proot/src/arch.h 中各架构宏定义。
+    # 直接传递给 make 而非由 make 的 $(shell) 探测，因为 ezwinports make 的
+    # $(shell) 在 Windows 上不可靠。
+    $loaderAddress = switch ($CC文件名) {
+        { $_ -match '^aarch64-' } { '0x2000000000' }
+        { $_ -match '^x86_64-' }  { '0x600000000000' }
+        { $_ -match '^i[36]86-' } { '0xa0000000' }
+        { $_ -match '^arm' }      { '0x20000000' }
+        default { 输出错误 "无法确定架构 $CC文件名 的 LOADER_ADDRESS"; exit 1 }
+    }
+    $loader32Address = switch ($CC32文件名) {
+        { $_ -match '^arm' }      { '0x20000000' }
+        { $_ -match '^i[36]86-' } { '0xa0000000' }
+        default { '0x20000000' }  # 32-bit ARM as fallback
+    }
+
+    # ── 预生成 build.h ──
+    # build.h 由 GNUmakefile 的 auto-configuration 生成：编译 .check_* 测试程序
+    # 然后执行它们来探测宿主系统特性（process_vm, seccomp_filter）。
+    # 但交叉编译时测试程序无法在 Windows 上执行，$(shell egrep ...) 探测
+    # 哪些源文件依赖 build.h 也会失败（USE_BUILD_H 为空），导致 build.h
+    # 永远不会被生成。直接预生成，包含目标平台已知的特性定义。
+    # Android aarch64 API 28+ 支持 process_vm 和 seccomp_filter。
+    $version = & git -C $Proot源码根目录 describe --tags --dirty --abbrev=8 --always 2>$null
+    if (-not $version) { $version = "unknown" }
+    $buildH路径 = Join-Path $构建目录 "build.h"
+    [System.IO.File]::WriteAllText($buildH路径, @"
+/* Auto-generated for cross-compilation to Android aarch64. */
+#ifndef BUILD_H
+#define BUILD_H
+#undef VERSION
+#define VERSION "$version"
+#define HAVE_PROCESS_VM
+#define HAVE_SECCOMP_FILTER
+#endif /* BUILD_H */
+"@, [System.Text.UTF8Encoding]::new($false))
+
+    $buildScript路径 = Join-Path $构建目录 "run-make.sh"
+    $buildScriptContent = @"
+#!/bin/bash
+set -e
+cd "$unixBuildDir"
+# 禁止 MSYS2 自动将 /data/... 转换为 C:/Program Files/Git/data/...
+# PROOT_UNBUNDLE_LOADER 的值是 Android 设备上的路径，不是 Windows 路径。
+export MSYS2_ARG_CONV_EXCL="PROOT_UNBUNDLE_LOADER"
+exec "$unixMAKE" \
+  -f "$unixMakefile" \
+  -j$([Environment]::ProcessorCount) \
+  V=1 \
+  "SHELL=$winSH" \
+  CC=./cc-wrapper.sh \
+  CC32=./cc32-wrapper.sh \
+  CC32_FLAG= \
+  STRIP="$unixSTRIP" \
+  READELF="$unixREADELF" \
+  OBJCOPY="$unixOBJCOPY" \
+  OBJDUMP="$unixOBJDUMP" \
+  PROOT_UNBUNDLE_LOADER=$PROOT_UNBUNDLE_LOADER \
+  HAS_LOADER_32BIT=true \
+  HAS_POKEDATA_WORKAROUND=true \
+  LOADER_ADDRESS=$loaderAddress \
+  LOADER_ADDRESS-m32=$loader32Address \
+  "BUILD_ID_NONE=,--build-id=none" \
+  "USE_BUILD_H=cli/cli.o cli/proot.o execve/aoxp.o extension/extension.o path/path.o syscall/seccomp.o tracee/mem.o" \
+  "CPPFLAGS=-D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -I. -I$unixSrcDir -I$unixTallocInc -DARG_MAX=131072 -Wno-error=implicit-function-declaration" \
+  "LDFLAGS=-L$unixTallocLib -ltalloc -Wl,-z,noexecstack"
+"@
+    [System.IO.File]::WriteAllText($buildScript路径, $buildScriptContent,
+        [System.Text.UTF8Encoding]::new($false))
+
+    # ── 执行构建 ──
+    Write-Host "  bash run-make.sh" -ForegroundColor DarkGray
+    $make输出 = & $SH路径 $buildScript路径 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        foreach ($行 in @($make输出)) { Write-Host "  $行" -ForegroundColor Red }
+        输出错误 "proot make 失败 (exit code: $LASTEXITCODE)"
+        exit 1
+    }
+    foreach ($行 in @($make输出)) { Write-Host "  $行" -ForegroundColor DarkGray }
+
+    # ── 验证产物 ──
+    $Proot产物 = Join-Path $构建目录 "proot"
+    $Loader产物 = Join-Path $构建目录 "loader/loader"
+    $Loader32产物 = Join-Path $构建目录 "loader/loader-m32"
+
+    if (-not (Test-Path $Proot产物)) { 输出错误 "proot 产物不存在: $Proot产物"; exit 1 }
+    if (-not (Test-Path $Loader产物)) { 输出错误 "loader 产物不存在: $Loader产物"; exit 1 }
+
+    & $STRIP路径 $Proot产物 2>&1 | Out-Null
+    & $STRIP路径 $Loader产物 2>&1 | Out-Null
+
+    $prootSizeKB = [math]::Round((Get-Item $Proot产物).Length / 1KB, 1)
+    $loaderSizeKB = [math]::Round((Get-Item $Loader产物).Length / 1KB, 1)
+    输出成功 "proot: $prootSizeKB KB, loader: $loaderSizeKB KB"
+
+    if (Test-Path $Loader32产物) {
+        & $STRIP路径 $Loader32产物 2>&1 | Out-Null
+        $loader32SizeKB = [math]::Round((Get-Item $Loader32产物).Length / 1KB, 1)
+        输出成功 "loader32: $loader32SizeKB KB"
+    }
+}
+
+function 编译Proot {
+    输出步骤 "交叉编译 proot → Android"
+
+    $Proot源码Src = Join-Path $Proot源码根目录 "src"
+    if (-not (Test-Path (Join-Path $Proot源码Src "GNUmakefile"))) {
+        输出警告 "proot 子模块不存在或不完整，跳过 proot 编译"
+        return
+    }
+
+    $NDK工具链 = 查找NDK工具链
+    $工具链Bin = $NDK工具链.工具链Bin目录
+    $Talloc头文件目录 = 准备Talloc头文件
+
+    # ── arm64（主目标：华为设备、大多数现代 Android 手机）──
+    $arm64编译状态 = 获取Proot编译状态 "arm64"
+    if ($arm64编译状态.需要编译) {
+        输出步骤 "编译 proot arm64 ($($arm64编译状态.原因))"
+        编译Proot单架构 `
+            -架构名称 "arm64" `
+            -CC路径 (Join-Path $工具链Bin "aarch64-linux-android${NDK接口级别}-clang.cmd") `
+            -CC32路径 (Join-Path $工具链Bin "armv7a-linux-androideabi${NDK接口级别}-clang.cmd") `
+            -STRIP路径 (Join-Path $工具链Bin "llvm-strip.exe") `
+            -READELF路径 (Join-Path $工具链Bin "llvm-readelf.exe") `
+            -OBJCOPY路径 (Join-Path $工具链Bin "llvm-objcopy.exe") `
+            -OBJDUMP路径 (Join-Path $工具链Bin "llvm-objdump.exe") `
+            -Talloc头文件目录 $Talloc头文件目录 `
+            -Talloc库目录 (Join-Path $Acode源码根目录 "src/plugins/proot/libs/arm64")
+
+        设置构建缓存值 "proot|arm64" $arm64编译状态.当前签名
+        输出成功 "proot arm64 编译完成"
+    } else {
+        输出成功 "proot arm64 源码未变化，跳过编译"
+    }
+}
+
+function 应用Proot编译产物到平台 {
+    # 将 build cache 中编译好的 proot 二进制覆盖到平台 jniLibs，这样构建出的 APK
+    # 使用的是最新编译的 proot 而不是 Acode 源码树中的预编译版本。
+    # 仅修改平台产物目录，不改动 Acode 源码树，因此不影响源码保护校验。
+    $arm64构建目录 = Join-Path $构建缓存目录 "proot-build/arm64"
+    $Proot产物 = Join-Path $arm64构建目录 "proot"
+    $Loader产物 = Join-Path $arm64构建目录 "loader/loader"
+    $Loader32产物 = Join-Path $arm64构建目录 "loader/loader-m32"
+
+    if (-not (Test-Path $Proot产物) -or -not (Test-Path $Loader产物)) {
+        输出警告 "未找到 proot 编译产物，平台将使用预编译版本"
+        return
+    }
+
+    $jniLibs目录 = Join-Path $平台根目录 "app/src/main/jniLibs/arm64-v8a"
+    if (-not (Test-Path $jniLibs目录)) {
+        输出警告 "平台 jniLibs/arm64-v8a 目录不存在，跳过 proot 产物部署"
+        return
+    }
+
+    Copy-Item $Proot产物 (Join-Path $jniLibs目录 "libproot-xed.so") -Force
+    Copy-Item $Loader产物 (Join-Path $jniLibs目录 "libproot.so") -Force
+
+    if ((Test-Path $Loader32产物) -and (Test-Path (Join-Path $jniLibs目录 "libproot32.so"))) {
+        Copy-Item $Loader32产物 (Join-Path $jniLibs目录 "libproot32.so") -Force
+    }
+
+    输出成功 "已将 proot 编译产物部署到平台 jniLibs/arm64-v8a"
+}
+
 # ─── 构建前端资源 ─────────────────────────────────────────────────────
 function 构建前端 {
     输出步骤 "构建前端资源"
@@ -2183,8 +2581,14 @@ switch ($动作) {
         编译AcodexServer
     }
 
+    "build-proot" {
+        初始化构建环境
+        编译Proot
+    }
+
     "build-apk" {
         初始化构建环境
+        编译Proot
         清空调试服务器输出日志
         安装Node依赖
         开始源码保护
@@ -2192,6 +2596,7 @@ switch ($动作) {
         确保DebugAxs下载源可用
         构建前端
         同步前端产物到平台
+        应用Proot编译产物到平台
         应用调试构建改动
         构建APK
         验证源码未被修改
@@ -2208,6 +2613,7 @@ switch ($动作) {
     "full" {
         初始化构建环境
         初始化子模块
+        编译Proot
         清空调试服务器输出日志
         安装Node依赖
         开始源码保护
@@ -2218,6 +2624,7 @@ switch ($动作) {
         }
         构建前端
         同步前端产物到平台
+        应用Proot编译产物到平台
         应用调试构建改动
         $APK文件 = 构建APK
         验证源码未被修改
