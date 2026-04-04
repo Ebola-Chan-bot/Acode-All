@@ -7,3 +7,6 @@
 [submodule "acodex-server"]
 	path = acodex-server
 	url = https://github.com/Ebola-Chan-bot/acodex_server.git
+[submodule "proot"]
+	path = proot
+	url = https://github.com/termux/proot.git
