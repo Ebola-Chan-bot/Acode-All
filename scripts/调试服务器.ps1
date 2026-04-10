@@ -66,12 +66,15 @@ function 测试端口可连接([string]$主机, [int]$目标端口, [int]$超时
 }
 
 function 清理启动器残留端口([int]$目标端口) {
-    $占用连接列表 = @(Get-NetTCPConnection -LocalPort $目标端口 -ErrorAction SilentlyContinue)
+    # 根因：Get-NetTCPConnection 默认会返回非监听连接，可能指向系统/受保护 PID，
+    # 启动器对这些 PID 调用 Kill 会触发“拒绝访问”并中断启动流程。
+    # 这里只清理真正的监听占用，避免误杀并确保新实例能正常拉起。
+    $占用连接列表 = @(Get-NetTCPConnection -LocalPort $目标端口 -State Listen -ErrorAction SilentlyContinue)
     $占用进程ID列表 = @($占用连接列表 | Select-Object -ExpandProperty OwningProcess -Unique)
 
     foreach ($占用进程ID in $占用进程ID列表) {
         try {
-            # 默认后台模式必须在拉起新子进程前清掉残留监听；否则旧调试服务器会让后面的端口探测直接命中旧进程，启动器误判“新实例已就绪”，结果 metadata 保持旧地址，后续构建继续注入过期下载源。这里用独立前置清理逻辑，避免再依赖后文函数定义顺序。 仅调试用
+            # 默认后台模式必须在拉起新子进程前清掉残留监听；否则旧调试服务器会让后面的端口探测直接命中旧进程，启动器误判“新实例已就绪”，结果 metadata 保持旧地址，后续构建继续注入过期下载源。这里用独立前置清理逻辑，避免再依赖后文函数定义顺序。
             $占用进程 = [System.Diagnostics.Process]::GetProcessById([int]$占用进程ID)
             写启动器日志 "启动前清理残留端口占用: 端口=$目标端口 PID=$占用进程ID 进程=$($占用进程.ProcessName)"
             $占用进程.Kill()
@@ -437,6 +440,7 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
   window.__HDC_DEBUG_ACTIVE=true;
     var WS_URL="wss://${IP}:${P}";
     var ws=null,queue=[],reconnectTimer=null;
+    var __hdcConsoleWrapped=false;
     function safeText(value){
         if(value===undefined)return "undefined";
         if(value===null)return "null";
@@ -446,7 +450,7 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
             if(typeof val==="function")return "[Function]";
             if(typeof HTMLElement!=="undefined"&&val instanceof HTMLElement)return val.outerHTML.substring(0,200);
             return val;
-        })}catch(e){return "[无法序列化]"}
+        })}catch(e){return String(value)}
     }
   function connect(){
         try{ws=new WebSocket(WS_URL)}catch(e){return}
@@ -461,7 +465,7 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
     ws.onmessage=function(evt){
       try{var msg=JSON.parse(evt.data);
                 if(msg.type==="reload")location.reload();
-                else if(msg.type==="eval"){try{eval(msg.code)}catch(e){send({type:"error",message:e.message,stack:e.stack})}}
+                else if(msg.type==="eval"){try{eval(msg.code)}catch(e){}}
       }catch(e){}
     };
   }
@@ -470,271 +474,22 @@ function 生成调试客户端JS([string]$IP, [int]$P) {
     if(ws&&ws.readyState===1)ws.send(data);
     else if(queue.length<200)queue.push(data);
   }
-    function safeClassName(value){
-        try{return Object.prototype.toString.call(value)}catch(e){return "[class-error]"}
-    }
-        var debugBuildId=typeof window.__HDC_DEBUG_BUILD_ID==="string"?window.__HDC_DEBUG_BUILD_ID:"";
-        var debugScriptUrl=typeof window.__HDC_DEBUG_SCRIPT_URL==="string"?window.__HDC_DEBUG_SCRIPT_URL:"";
-    window.__HDC_DEBUG_PUSH=function(payload){
-        if(!payload||typeof payload!=="object")return;
-        if(!payload.timestamp)payload.timestamp=Date.now();
-        send(payload);
-    };
-    function hookScriptLifecycle(){
-        document.addEventListener("error",function(event){
-            var target=event&&event.target;
-            if(!target||target.tagName!=="SCRIPT")return;
-            send({type:"error",message:"Script load failed: "+(target.src||"[inline]"),timestamp:Date.now()});
-        },true);
-    }
-    function hookFetchApi(){
-        if(typeof window.fetch!=="function")return false;
-        if(window.fetch.__hdcWrapped)return true;
-        var originalFetch=window.fetch;
-        function tryParseJson(text){
-            if(typeof text!=="string")return text;
-            try{return JSON.parse(text)}catch(e){return text}
-        }
-        // exit 182 调查依赖 bootstrap/PTY/fetch 时序，而不是触摸、滚动或页签布局噪音。
-        // terminal-layout 这组日志已经证明不会提供根因信息，只会放大运行时噪音，
-        // 所以这里明确不再采集布局快照。 仅调试用
-        function shouldTraceFetch(resource){
-            var url="";
-            try{
-                if(typeof resource==="string")url=resource;
-                else if(resource&&typeof resource.url==="string")url=resource.url;
-            }catch(e){}
-            return url.indexOf("http://localhost:8767/")===0;
-        }
-        window.fetch=function(resource,options){
-            var trace=shouldTraceFetch(resource);
-            var method=(options&&options.method)||"GET";
-            var url="";
-            try{
-                if(typeof resource==="string")url=resource;
-                else if(resource&&typeof resource.url==="string")url=resource.url;
-            }catch(e){}
-            var startedAt=Date.now();
-            if(trace){
-                var body=null;
-                try{
-                    body=options&&typeof options.body==="string"?tryParseJson(options.body):safeText(options&&options.body);
-                }catch(e){
-                    body="[body-read-failed] "+safeText(e);
-                }
-                send({
-                    type:"console",
-                    level:"debug",
-                    args:["[fetch]",method,url,"begin",{body:body}],
-                    timestamp:startedAt
-                });
-            }
-            var result;
-            try{
-                result=originalFetch.apply(this,arguments);
-            }catch(error){
-                if(trace){
-                    send({type:"error",message:"fetch threw: "+method+" "+url+" "+safeText(error),stack:error&&error.stack,timestamp:Date.now()});
-                }
-                throw error;
-            }
-            if(!result||typeof result.then!=="function")return result;
-            return result.then(function(response){
-                if(trace){
-                    send({
-                        type:"console",
-                        level:"debug",
-                        args:["[fetch]",method,url,"resolved","status="+response.status,"ok="+(!!response.ok),"elapsedMs="+(Date.now()-startedAt)],
-                        timestamp:Date.now()
-                    });
-                }
-                return response;
-            }).catch(function(error){
-                if(trace){
-                    send({type:"error",message:"fetch rejected: "+method+" "+url+" "+safeText(error),stack:error&&error.stack,timestamp:Date.now()});
-                }
-                throw error;
-            });
-        };
-        window.fetch.__hdcWrapped=true;
-        send({type:"console",level:"info",args:["[fetch-api] hooked"],timestamp:Date.now()});
-        return true;
-    }
-    function hookCordovaModuleApi(){
-        if(!window.cordova||typeof window.cordova.require!=="function")return false;
-        if(window.cordova.require.__hdcWrapped)return true;
-        var originalRequire=window.cordova.require;
-        var originalDefine=typeof window.cordova.define==="function"?window.cordova.define:null;
-        window.cordova.require=function(id){
-            try{return originalRequire.apply(this,arguments)}catch(error){
-                send({type:"error",message:"cordova.require failed: "+id,stack:error&&error.stack,timestamp:Date.now()});
-                throw error;
-            }
-        };
-        window.cordova.require.__hdcWrapped=true;
-        if(originalDefine&&!originalDefine.__hdcWrapped){
-            window.cordova.define=function(id,factory){
-                send({type:"console",level:"debug",args:["[cordova-define]",id],timestamp:Date.now()});
-                return originalDefine.apply(this,arguments);
+    function wrapConsolePassthrough(){
+        if(__hdcConsoleWrapped)return;
+        __hdcConsoleWrapped=true;
+        var original={};
+        ["log","info","warn","error","debug"].forEach(function(level){
+            original[level]=console[level]||console.log;
+            console[level]=function(){
+                original[level].apply(console,arguments);
+                var args=[];
+                for(var i=0;i<arguments.length;i++)args.push(safeText(arguments[i]));
+                send({type:"console",level:level,args:args,timestamp:Date.now()});
             };
-            window.cordova.define.__hdcWrapped=true;
-        }
-        send({type:"console",level:"info",args:["[cordova-api] hooked"],timestamp:Date.now()});
-        return true;
-    }
-    var terminalMirrorWindowStartedAt=Date.now();
-    var terminalMirrorCharsInWindow=0;
-    var terminalMirrorDropped=0;
-    function resetTerminalMirrorBudgetIfNeeded(){
-        var now=Date.now();
-        if(now-terminalMirrorWindowStartedAt<1000)return;
-        if(terminalMirrorDropped>0){
-            send({type:"console",level:"warn",args:["[terminal-mirror] dropped frames",String(terminalMirrorDropped)],timestamp:now});
-            terminalMirrorDropped=0;
-        }
-        terminalMirrorWindowStartedAt=now;
-        terminalMirrorCharsInWindow=0;
-    }
-    function sanitizeTerminalText(text){
-        return String(text||"")
-            .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g,"")
-            .replace(/\r/g,"")
-            .replace(/\u0000/g,"");
-    }
-    function emitTerminalMirror(url,text){
-        resetTerminalMirrorBudgetIfNeeded();
-        var cleaned=sanitizeTerminalText(text);
-        if(!cleaned.trim())return;
-        if(terminalMirrorCharsInWindow>=32768){
-            terminalMirrorDropped++;
-            return;
-        }
-        if(cleaned.length>2048)cleaned=cleaned.slice(0,2048)+"\n...[truncated]";
-        terminalMirrorCharsInWindow+=cleaned.length;
-        send({type:"console",level:"debug",args:["[terminal]",url,cleaned],timestamp:Date.now()});
-    }
-    function decodeTerminalPayload(data){
-        if(typeof data==="string")return Promise.resolve(data);
-        if(typeof ArrayBuffer!=="undefined"&&data instanceof ArrayBuffer){
-            return Promise.resolve(new TextDecoder("utf-8",{fatal:false}).decode(new Uint8Array(data)));
-        }
-        if(typeof Blob!=="undefined"&&data instanceof Blob){
-            return data.text();
-        }
-        return Promise.resolve("");
-    }
-    function hookTerminalSocket(socket,url){
-        if(typeof url!=="string")return socket;
-        if(url.indexOf("ws://localhost:")!==0||url.indexOf("/terminals/")===-1)return socket;
-        send({type:"console",level:"info",args:["[terminal-mirror] hooked",url],timestamp:Date.now()});
-        socket.addEventListener("message",function(evt){
-            decodeTerminalPayload(evt.data).then(function(text){
-                emitTerminalMirror(url,text);
-            }).catch(function(err){
-                send({type:"console",level:"warn",args:["[terminal-mirror] decode failed",safeText(err)],timestamp:Date.now()});
-            });
         });
-        return socket;
     }
-    var NativeWebSocket=window.WebSocket;
-    function PatchedWebSocket(url,protocols){
-        var socket=arguments.length>1?new NativeWebSocket(url,protocols):new NativeWebSocket(url);
-        return hookTerminalSocket(socket,String(url||""));
-    }
-    PatchedWebSocket.prototype=NativeWebSocket.prototype;
-    try{
-        ["CONNECTING","OPEN","CLOSING","CLOSED"].forEach(function(key){
-            Object.defineProperty(PatchedWebSocket,key,{value:NativeWebSocket[key]});
-        });
-    }catch(e){}
-    window.WebSocket=PatchedWebSocket;
-    function wrapTerminalMethod(target,name,wrapperTag){
-        if(!target||typeof target[name]!=="function")return false;
-        var original=target[name];
-        if(original.__hdcWrapped)return true;
-        function wrapTerminalCallback(methodName,callbackIndex,callback,label){
-            if(typeof callback!=="function")return callback;
-            if(callback.__hdcWrappedCallback)return callback;
-            var wrappedCallback=function(){
-                var callbackArgs=[];
-                for(var j=0;j<arguments.length;j++)callbackArgs.push(arguments[j]);
-                send({type:"console",level:label,args:["[terminal-api-stream]",methodName,"callback#"+callbackIndex,safeText(callbackArgs)],timestamp:Date.now()});
-                return callback.apply(this,arguments);
-            };
-            wrappedCallback.__hdcWrappedCallback=true;
-            return wrappedCallback;
-        }
-        var wrapped=function(){
-            var args=[];
-            for(var i=0;i<arguments.length;i++)args.push(arguments[i]);
-            send({type:"console",level:"info",args:[wrapperTag,name,"begin",safeText(args)],timestamp:Date.now()});
-            if(name==="install"||name==="startAxs"){
-                for(var k=0;k<args.length;k++){
-                    if(typeof args[k]!=="function")continue;
-                    var callbackLevel=(k===0&&name==="install")||(k===1&&name==="startAxs")?"info":"error";
-                    args[k]=wrapTerminalCallback(name,k,args[k],callbackLevel);
-                }
-            }
-            try{
-                var result=original.apply(this,args);
-                if(result&&typeof result.then==="function"){
-                    return result.then(function(value){
-                        send({type:"console",level:"info",args:[wrapperTag,name,"resolved",safeText(value)],timestamp:Date.now()});
-                        return value;
-                    }).catch(function(error){
-                        send({type:"console",level:"error",args:[wrapperTag,name,"rejected",safeText(error)],timestamp:Date.now()});
-                        throw error;
-                    });
-                }
-                send({type:"console",level:"info",args:[wrapperTag,name,"returned",safeText(result)],timestamp:Date.now()});
-                return result;
-            }catch(error){
-                send({type:"console",level:"error",args:[wrapperTag,name,"threw",safeText(error)],timestamp:Date.now()});
-                throw error;
-            }
-        };
-        wrapped.__hdcWrapped=true;
-        target[name]=wrapped;
-        return true;
-    }
-    function hookTerminalApi(){
-        var terminal=window.Terminal;
-        if(!terminal||typeof terminal!=="object")return false;
-        var hooked=false;
-        ["isInstalled","install","startAxs","stopAxs","isAxsRunning"].forEach(function(name){
-            if(wrapTerminalMethod(terminal,name,"[terminal-api]"))hooked=true;
-        });
-        return hooked;
-    }
-    (function waitTerminalApi(attempt){
-        if(hookTerminalApi()){
-            send({type:"console",level:"info",args:["[terminal-api] hooked"],timestamp:Date.now()});
-            return;
-        }
-        if(attempt>=120)return;
-        setTimeout(function(){waitTerminalApi(attempt+1)},250);
-    })(0);
-    (function waitCordovaApi(attempt){
-        if(hookCordovaModuleApi())return;
-        if(attempt>=120)return;
-        setTimeout(function(){waitCordovaApi(attempt+1)},250);
-    })(0);
-    hookFetchApi();
-    hookScriptLifecycle();
-        if(debugBuildId){
-                send({type:"console",level:"info",args:["[debug-build]","buildId="+debugBuildId,"scriptUrl="+debugScriptUrl,"href="+location.href],timestamp:Date.now()});
-        }
-    send({type:"console",level:"info",args:["[env]","userAgent="+navigator.userAgent,"processType="+typeof window.process,"processClass="+safeClassName(window.process),"hasCordova="+(!!window.cordova)],timestamp:Date.now()});
-  var _c={};
-  ["log","info","warn","error","debug"].forEach(function(l){
-    _c[l]=console[l];
-    console[l]=function(){
-      _c[l].apply(console,arguments);
-            var args=[];
-            for(var i=0;i<arguments.length;i++)args.push(safeText(arguments[i]));
-      send({type:"console",level:l,args:args,timestamp:Date.now()});
-    };
-  });
+    // 需求：必须看到手机端“实际产生”的日志，这里仅做透传，不注入 fetch/terminal 等额外诊断日志。
+    wrapConsolePassthrough();
     window.addEventListener("error",function(e){
         var parts=[e.message];
         if(e.filename)parts.push("@"+e.filename+":"+e.lineno+":"+e.colno);
