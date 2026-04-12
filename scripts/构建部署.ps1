@@ -88,17 +88,6 @@ if (-not $设备模式是否显式指定) {
 
 $ErrorActionPreference = "Continue"
 
-if ($构建模式 -eq "release") {
-    if ($Axs下载源 -ne "default") {
-        输出错误 "release 构建禁止切换 AXS 下载源。"
-        exit 1
-    }
-    if ($注入调试日志) {
-        # release 构建静默忽略调试客户端接入，避免发布包携带调试入口。
-        $注入调试日志 = $false
-    }
-}
-
 # ─── 路径配置 ─────────────────────────────────────────────────────────
 $工作区根目录     = Resolve-Path (Join-Path $PSScriptRoot "..")
 $Acode源码根目录  = Join-Path $工作区根目录 "Acode"
@@ -132,6 +121,18 @@ function 输出步骤($消息) { Write-Host "`n▶ $消息" -ForegroundColor Cya
 function 输出成功($消息) { Write-Host "  ✓ $消息" -ForegroundColor Green }
 function 输出警告($消息) { Write-Host "  ⚠ $消息" -ForegroundColor Yellow }
 function 输出错误($消息) { Write-Host "  ✗ $消息" -ForegroundColor Red }
+
+# ─── release 模式参数校验（需要工具函数已定义）────────────────────────
+if ($构建模式 -eq "release") {
+    if ($Axs下载源 -ne "default") {
+        输出错误 "release 构建禁止切换 AXS 下载源。"
+        exit 1
+    }
+    if ($注入调试日志) {
+        # release 构建静默忽略调试客户端接入，避免发布包携带调试入口。
+        $注入调试日志 = $false
+    }
+}
 
 function 检查命令($命令, $提示) {
     if (-not (Get-Command $命令 -ErrorAction SilentlyContinue)) {
@@ -842,12 +843,14 @@ function 初始化构建环境 {
     if ($Gradle命令) {
         $script:Gradle路径 = $Gradle命令.Source
     } else {
+        # 按语义版本号降序排列，取最新版本的 gradle.bat
+        # 字符串排序会导致 8.9 > 8.14（'9' > '1'），必须用 [version] 比较
         $Gradle候选列表 = @(
             (Get-ChildItem (Join-Path $env:USERPROFILE ".gradle\wrapper\dists") -Recurse -Filter "gradle.bat" -ErrorAction SilentlyContinue |
-                Sort-Object FullName -Descending |
+                Sort-Object { if ($_.FullName -match 'gradle-([0-9.]+)') { [version]$Matches[1] } else { [version]'0.0' } } -Descending |
                 Select-Object -ExpandProperty FullName),
             (Get-ChildItem "C:\Program Files\Android\Android Studio" -Recurse -Filter "gradle.bat" -ErrorAction SilentlyContinue |
-                Sort-Object FullName -Descending |
+                Sort-Object { if ($_.FullName -match 'gradle-([0-9.]+)') { [version]$Matches[1] } else { [version]'0.0' } } -Descending |
                 Select-Object -ExpandProperty FullName)
         ) | Where-Object { $_ }
 
@@ -1729,6 +1732,27 @@ function 重建CordovaAndroid平台 {
         }
     } else {
         输出步骤 "初始化 Cordova Android 平台"
+    }
+
+    # cordova platform add 只在 plugins/android.json 的 installed_plugins 为空时
+    # 才会自动安装插件到新平台。如果 installed_plugins 中有残留记录（如 cordova platform
+    # remove 写回或上次构建遗留），Cordova 认为插件已安装而跳过，导致新平台缺少插件文件。
+    # 在重建平台前清空 installed_plugins，使 cordova platform add 重新走完整插件安装流程。
+    $PluginsJsonPath = Join-Path $Acode根目录 "plugins/android.json"
+    if (Test-Path $PluginsJsonPath -PathType Leaf) {
+        $清空脚本 = @'
+const fs = require("fs");
+const p = process.argv[2];
+const d = JSON.parse(fs.readFileSync(p, "utf8"));
+d.installed_plugins = {};
+d.dependent_plugins = {};
+fs.writeFileSync(p, JSON.stringify(d, null, 2) + "\n");
+'@
+        $清空结果 = 执行Node脚本并捕获输出 -脚本 $清空脚本 -参数 @($PluginsJsonPath)
+        if ($清空结果.退出码 -ne 0) {
+            输出错误 "无法清空 plugins/android.json 的 installed_plugins"
+            exit 1
+        }
     }
 
     Write-Host "  添加 Android 平台: $平台包" -ForegroundColor DarkGray
