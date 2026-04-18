@@ -40,7 +40,8 @@ if (-not (Test-Path $日志目录)) { New-Item -ItemType Directory -Path $日志
 $后台启动日志 = Join-Path $日志目录 "调试服务器-启动器.log"
 
 function 写启动器日志([string]$消息) {
-    $时间戳 = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    # 只输出当前时分秒毫秒，不带日期，也不额外加"收到时间"
+    $时间戳 = Get-Date -Format "HH:mm:ss.fff"
     [System.IO.File]::AppendAllText(
         $后台启动日志,
         "$时间戳 $消息`r`n",
@@ -145,10 +146,11 @@ function 追加调试日志 {
         [string]$消息
     )
 
-    $时间戳 = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
+    # 不再添加"日志收到时间"前缀：客户端转发的日志本身已带产生时间（HH:mm:ss），
+    # 服务器本地事件（HTTP/WS/TLS 等）由调用方按需自带时间戳。
     [System.IO.File]::AppendAllText(
         $日志文件,
-        "$时间戳 $消息`r`n",
+        "$消息`r`n",
         [System.Text.UTF8Encoding]::new($false)
     )
 }
@@ -157,14 +159,18 @@ function 写调试日志 {
     param(
         [string]$消息,
         [string]$颜色 = "White",
-        [switch]$不换行
+        [switch]$不换行,
+        [switch]$无时间戳
     )
 
-    追加调试日志 $消息
+    # 服务器本地事件没有客户端"产生时间"，此处补一个 HH:mm:ss.fff；
+    # 横幅/提示行通过 -无时间戳 显式跳过，保持美观。
+    $输出 = if ($无时间戳) { $消息 } else { "$((Get-Date).ToString('HH:mm:ss.fff')) $消息" }
+    追加调试日志 $输出
     if ($不换行) {
-        Write-Host $消息 -ForegroundColor $颜色 -NoNewline
+        Write-Host $输出 -ForegroundColor $颜色 -NoNewline
     } else {
-        Write-Host $消息 -ForegroundColor $颜色
+        Write-Host $输出 -ForegroundColor $颜色
     }
 }
 
@@ -844,9 +850,9 @@ $tcp监听器 = [System.Net.Sockets.TcpListener]::new($绑定地址, $端口)
 $tcp监听器.Start()
 
 Write-Host ""
-写调试日志 "╔══════════════════════════════════════════════╗" Green
-写调试日志 "║     HDC 远程调试服务器已启动                ║" Green
-写调试日志 "╠══════════════════════════════════════════════╣" Green
+写调试日志 "╔═══════════════════════════════════════════╗" Green -无时间戳
+写调试日志 "║     HDC 远程调试服务器已启动                ║" Green -无时间戳
+写调试日志 "╠═══════════════════════════════════════════╣" Green -无时间戳
 Write-Host "║ 局域网: " -ForegroundColor Green -NoNewline
 Write-Host "https://${局域网IP}:${端口}" -ForegroundColor Cyan -NoNewline
 Write-Host "               ║" -ForegroundColor Green
@@ -863,11 +869,11 @@ Write-Host "║ 监视:   " -ForegroundColor Green -NoNewline
 if ($监视) { Write-Host "已开启" -ForegroundColor Green -NoNewline } else { Write-Host "未开启" -ForegroundColor DarkGray -NoNewline }
 Write-Host "                              ║" -ForegroundColor Green
 追加调试日志 "║ 监视:   $(if ($监视) { '已开启' } else { '未开启' })                              ║"
-写调试日志 "╚══════════════════════════════════════════════╝" Green
+写调试日志 "╚═══════════════════════════════════════════╝" Green -无时间戳
 Write-Host ""
-写调试日志 "提示: 确保手机和电脑在同一局域网" DarkGray
-写调试日志 "证书: $调试证书Cer路径" DarkGray
-写调试日志 "元数据: $调试证书元数据路径" DarkGray
+写调试日志 "提示: 确保手机和电脑在同一局域网" DarkGray -无时间戳
+写调试日志 "证书: $调试证书Cer路径" DarkGray -无时间戳
+写调试日志 "元数据: $调试证书元数据路径" DarkGray -无时间戳
 Write-Host ""
 
 # ─── 文件监视（独立 Runspace，不依赖 PS 事件队列）─────────────────────
