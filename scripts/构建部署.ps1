@@ -17,7 +17,6 @@
     full         = 完整流程（首次使用推荐）
     setup        = 仅初始化环境和依赖
     build-server = 仅编译 acodex-server
-    build-proot  = 仅编译 proot（交叉编译 → Android）
     build-apk    = 仅构建 APK（仅在使用调试服务器 AXS 下载源时会自动补编译）
     deploy       = 仅推送已构建的 APK 到手机
     clean        = 清理构建产物
@@ -54,7 +53,7 @@
 #>
 
 param(
-    [ValidateSet("full", "setup", "build-server", "build-proot", "build-apk", "deploy", "clean")]
+    [ValidateSet("full", "setup", "build-server", "build-apk", "deploy", "clean")]
     [string]$动作 = "full",
 
     [ValidateSet("adb", "hdc")]
@@ -88,11 +87,21 @@ if (-not $设备模式是否显式指定) {
 
 $ErrorActionPreference = "Continue"
 
+if ($构建模式 -eq "release") {
+    if ($Axs下载源 -ne "default") {
+        输出错误 "release 构建禁止切换 AXS 下载源。"
+        exit 1
+    }
+    if ($注入调试日志) {
+        # release 构建静默忽略调试客户端接入，避免发布包携带调试入口。
+        $注入调试日志 = $false
+    }
+}
+
 # ─── 路径配置 ─────────────────────────────────────────────────────────
 $工作区根目录     = Resolve-Path (Join-Path $PSScriptRoot "..")
 $Acode源码根目录  = Join-Path $工作区根目录 "Acode"
 $Acodex根目录     = Join-Path $工作区根目录 "acodex-server"
-$Proot源码根目录  = Join-Path $工作区根目录 "proot"
 $HDC程序路径      = "C:\Program Files (x86)\HiSuite\hwtools\hdc.exe"
 $构建缓存目录     = Join-Path $工作区根目录 "scripts/logs/.build-cache"
 $构建缓存文件路径 = Join-Path $构建缓存目录 "state.json"
@@ -114,7 +123,6 @@ function 更新Acode工作目录([string]$根目录) {
 更新Acode工作目录 $Acode源码根目录
 
 . (Join-Path $PSScriptRoot "仓库常量.ps1")
-$仓库固定调试服务器端口 = 获取仓库固定调试服务器端口
 
 # ─── 工具函数 ─────────────────────────────────────────────────────────
 function 输出步骤($消息) { Write-Host "`n▶ $消息" -ForegroundColor Cyan }
@@ -122,48 +130,11 @@ function 输出成功($消息) { Write-Host "  ✓ $消息" -ForegroundColor Gre
 function 输出警告($消息) { Write-Host "  ⚠ $消息" -ForegroundColor Yellow }
 function 输出错误($消息) { Write-Host "  ✗ $消息" -ForegroundColor Red }
 
-# ─── release 模式参数校验（需要工具函数已定义）────────────────────────
-if ($构建模式 -eq "release") {
-    if ($Axs下载源 -ne "default") {
-        输出错误 "release 构建禁止切换 AXS 下载源。"
-        exit 1
-    }
-    if ($注入调试日志) {
-        # release 构建静默忽略调试客户端接入，避免发布包携带调试入口。
-        $注入调试日志 = $false
-    }
-}
-
 function 检查命令($命令, $提示) {
     if (-not (Get-Command $命令 -ErrorAction SilentlyContinue)) {
         输出错误 "找不到 '$命令'，$提示"
         exit 1
     }
-}
-
-# 通用 winget 安装辅助函数：检测命令是否存在，不存在则通过 winget 安装。
-# 安装后自动刷新 PATH，并尝试 winget Links 目录作为后备。
-function 确保命令可用([string]$命令名, [string]$winget包ID, [string]$说明) {
-    if (Get-Command $命令名 -ErrorAction SilentlyContinue) { return }
-    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "User") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "Machine")
-    if (Get-Command $命令名 -ErrorAction SilentlyContinue) { return }
-    输出步骤 "安装 $命令名（$说明）"
-    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-        输出错误 "找不到 $命令名 且 winget 不可用，请手动安装: winget install $winget包ID"
-        exit 1
-    }
-    winget install $winget包ID --accept-source-agreements --accept-package-agreements --silent 2>&1 | ForEach-Object { Write-Host "  $_" }
-    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "User") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "Machine")
-    if (-not (Get-Command $命令名 -ErrorAction SilentlyContinue)) {
-        $链接路径 = "$env:LOCALAPPDATA\Microsoft\WinGet\Links\$命令名.exe"
-        if (Test-Path $链接路径) {
-            $env:Path = "$env:LOCALAPPDATA\Microsoft\WinGet\Links;$env:Path"
-        } else {
-            输出错误 "$命令名 安装后仍不可用，请重启终端后重试"
-            exit 1
-        }
-    }
-    输出成功 "$命令名 已自动安装"
 }
 
 function 执行外部命令并输出 {
@@ -181,6 +152,7 @@ function 执行外部命令并输出 {
     # 构建脚本卡死在插件刷新、prepare、Gradle 或 HDC 推送阶段。
     $命令输出 = & $文件路径 @参数 2>&1
     $退出码 = $LASTEXITCODE
+    $script:最近外部命令输出 = @($命令输出 | ForEach-Object { [string]$_ })
 
     foreach ($输出项 in @($命令输出)) {
         Write-Host "  $输出项"
@@ -725,20 +697,242 @@ function 验证源码未被修改 {
     输出成功 "构建流程未产生 git 可见的 Acode 仓库改动"
 }
 
+function 转换Gradle版本对象([string]$版本文本) {
+    $版本号 = 提取版本号 $版本文本
+    if (-not $版本号) {
+        return $null
+    }
+
+    $片段 = @($版本号.Split('.') | ForEach-Object { [int]$_ })
+    while ($片段.Count -lt 3) {
+        $片段 += 0
+    }
+
+    return [version]::new($片段[0], $片段[1], $片段[2])
+}
+
+function 获取Gradle可执行版本([string]$Gradle路径) {
+    if ([string]::IsNullOrWhiteSpace($Gradle路径) -or -not (Test-Path $Gradle路径 -PathType Leaf)) {
+        return $null
+    }
+
+    $路径版本匹配 = [regex]::Match($Gradle路径, 'gradle-(\d+\.\d+(?:\.\d+)?)(?:-|\\|/)')
+    if ($路径版本匹配.Success) {
+        return $路径版本匹配.Groups[1].Value
+    }
+
+    $版本输出 = & $Gradle路径 --version 2>$null | Select-String '^Gradle\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)' | Select-Object -First 1
+    if ($版本输出 -and $版本输出.Line -match '^Gradle\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)') {
+        return $Matches[1]
+    }
+
+    return $null
+}
+
+function 获取Gradle候选列表 {
+    $候选路径 = [System.Collections.Generic.List[string]]::new()
+    $系统Gradle命令 = Get-Command gradle -ErrorAction SilentlyContinue
+    if ($系统Gradle命令) {
+        $候选路径.Add($系统Gradle命令.Source)
+    }
+
+    $搜索根列表 = @(
+        (Join-Path $构建缓存目录 "gradle"),
+        (Join-Path $env:USERPROFILE ".gradle\wrapper\dists"),
+        "C:\Program Files\Android\Android Studio"
+    )
+
+    foreach ($搜索根 in $搜索根列表) {
+        if (-not (Test-Path $搜索根)) {
+            continue
+        }
+        Get-ChildItem $搜索根 -Recurse -Filter "gradle.bat" -ErrorAction SilentlyContinue |
+            ForEach-Object { $候选路径.Add($_.FullName) }
+    }
+
+    $候选列表 = [System.Collections.Generic.List[object]]::new()
+    foreach ($路径 in @($候选路径 | Select-Object -Unique)) {
+        $版本 = 获取Gradle可执行版本 $路径
+        $版本对象 = 转换Gradle版本对象 $版本
+        if ($null -eq $版本对象) {
+            continue
+        }
+        $候选列表.Add([pscustomobject]@{
+            路径 = $路径
+            版本 = $版本
+            版本对象 = $版本对象
+        })
+    }
+
+    return @($候选列表)
+}
+
+function 安装Gradle到构建缓存([string]$Gradle版本) {
+    $Gradle版本号 = 提取版本号 $Gradle版本
+    if (-not $Gradle版本号) {
+        输出错误 "无法安装 Gradle：版本号无效: $Gradle版本"
+        exit 1
+    }
+
+    $Gradle缓存根目录 = Join-Path $构建缓存目录 "gradle"
+    $Gradle安装目录 = Join-Path $Gradle缓存根目录 "gradle-$Gradle版本号"
+    $Gradle可执行路径 = Join-Path $Gradle安装目录 "bin/gradle.bat"
+    if (Test-Path $Gradle可执行路径 -PathType Leaf) {
+        return $Gradle可执行路径
+    }
+
+    New-Item -ItemType Directory -Path $Gradle缓存根目录 -Force | Out-Null
+    $Gradle压缩包路径 = Join-Path $Gradle缓存根目录 "gradle-$Gradle版本号-bin.zip"
+    $下载地址 = "https://services.gradle.org/distributions/gradle-$Gradle版本号-bin.zip"
+
+    输出步骤 "自动安装 Gradle $Gradle版本号"
+    Write-Host "  下载: $下载地址" -ForegroundColor DarkGray
+    try {
+        Invoke-WebRequest -Uri $下载地址 -OutFile $Gradle压缩包路径 -UseBasicParsing -ErrorAction Stop
+    } catch {
+        输出错误 "Gradle $Gradle版本号 下载失败"
+        输出错误 $_.Exception.Message
+        exit 1
+    }
+
+    try {
+        Expand-Archive -Path $Gradle压缩包路径 -DestinationPath $Gradle缓存根目录 -Force
+    } catch {
+        输出错误 "Gradle $Gradle版本号 解压失败"
+        输出错误 $_.Exception.Message
+        exit 1
+    }
+
+    if (-not (Test-Path $Gradle可执行路径 -PathType Leaf)) {
+        输出错误 "Gradle $Gradle版本号 安装后仍找不到可执行文件: $Gradle可执行路径"
+        exit 1
+    }
+
+    return $Gradle可执行路径
+}
+
+function 获取Gradle官方当前版本 {
+    $版本接口 = "https://services.gradle.org/versions/current"
+    try {
+        $版本信息 = Invoke-RestMethod -Uri $版本接口 -UseBasicParsing -ErrorAction Stop
+    } catch {
+        输出错误 "无法获取 Gradle 官方当前版本: $版本接口"
+        输出错误 $_.Exception.Message
+        exit 1
+    }
+
+    $版本 = [string]$版本信息.version
+    if (-not (转换Gradle版本对象 $版本)) {
+        输出错误 "Gradle 官方版本接口返回了无效版本: $版本"
+        exit 1
+    }
+
+    return $版本
+}
+
+function 创建Gradle候选([string]$Gradle路径) {
+    $版本 = 获取Gradle可执行版本 $Gradle路径
+    $版本对象 = 转换Gradle版本对象 $版本
+    if ($null -eq $版本对象) {
+        return $null
+    }
+
+    return [pscustomobject]@{
+        路径 = $Gradle路径
+        版本 = $版本
+        版本对象 = $版本对象
+    }
+}
+
+function 选择已安装最新Gradle {
+    $候选列表 = @(获取Gradle候选列表 | Sort-Object 版本对象, 路径 -Descending)
+    if ($候选列表.Count -gt 0) {
+        return $候选列表 | Select-Object -First 1
+    }
+
+    $官方当前版本 = 获取Gradle官方当前版本
+    $安装路径 = 安装Gradle到构建缓存 $官方当前版本
+    return 创建Gradle候选 $安装路径
+}
+
+function 设置Gradle候选($Gradle候选) {
+    if ($null -eq $Gradle候选 -or -not (Test-Path $Gradle候选.路径 -PathType Leaf)) {
+        输出错误 "Gradle 候选无效，无法继续构建"
+        exit 1
+    }
+
+    $script:Gradle路径 = $Gradle候选.路径
+    $script:Gradle版本 = $Gradle候选.版本
+
+    $GradleBin目录 = Split-Path $script:Gradle路径
+    if ($env:PATH -notlike "*$GradleBin目录*") {
+        $env:PATH = "$GradleBin目录;$env:PATH"
+    }
+
+    输出成功 "Gradle: $($script:Gradle版本) ($script:Gradle路径)"
+}
+
+function 设置Gradle为已安装最新版 {
+    设置Gradle候选 (选择已安装最新Gradle)
+}
+
+function 确保Gradle满足真实需求([string]$最低版本) {
+    $最低版本对象 = 转换Gradle版本对象 $最低版本
+    if ($null -eq $最低版本对象) {
+        输出错误 "Gradle 最低版本号无效: $最低版本"
+        exit 1
+    }
+
+    $当前版本对象 = 转换Gradle版本对象 $script:Gradle版本
+    if ($当前版本对象 -and $当前版本对象 -ge $最低版本对象) {
+        return $false
+    }
+
+    $官方当前版本 = 获取Gradle官方当前版本
+    $官方当前版本对象 = 转换Gradle版本对象 $官方当前版本
+    if ($官方当前版本对象 -lt $最低版本对象) {
+        输出错误 "Gradle 官方当前版本 $官方当前版本 低于构建真实最低要求 $最低版本"
+        exit 1
+    }
+
+    $安装路径 = 安装Gradle到构建缓存 $官方当前版本
+    设置Gradle候选 (创建Gradle候选 $安装路径)
+    return $true
+}
+
+function 从Gradle输出提取最低版本([string[]]$输出列表) {
+    foreach ($输出行 in @($输出列表)) {
+        if ($输出行 -match 'Minimum supported Gradle version is\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)') {
+            return $Matches[1]
+        }
+    }
+
+    return $null
+}
+
+function 测试Gradle输出是否为Android平台污染([string[]]$输出列表) {
+    $合并输出 = (@($输出列表) -join "`n")
+    if ($合并输出 -match 'CordovaLib[\\/].*已在.*定义') {
+        return $true
+    }
+    if ($合并输出 -match 'Duplicate resources' -and $合并输出 -match 'cdv_strings\.xml') {
+        return $true
+    }
+
+    return $false
+}
+
 # ─── 环境检测与自动配置 ───────────────────────────────────────────────
 function 初始化构建环境 {
     输出步骤 "检测构建环境"
 
-    确保命令可用 "git" "Git.Git" "版本控制"
+    检查命令 "git" "请安装 Git: https://git-scm.com/"
     输出成功 "Git: $(git --version)"
 
-    确保命令可用 "node" "OpenJS.NodeJS" "JavaScript 运行时"
+    检查命令 "node" "请安装 Node.js: https://nodejs.org/"
     输出成功 "Node.js: $(node --version)"
 
-    if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
-        输出错误 "npm 未随 Node.js 安装，请检查 Node.js 安装是否完整"
-        exit 1
-    }
+    检查命令 "npm" "请安装 npm（随 Node.js 安装）"
     输出成功 "npm: $(npm --version)"
 
     if (-not $env:JAVA_HOME -or -not (Test-Path (Join-Path $env:JAVA_HOME 'bin/javac.exe'))) {
@@ -755,16 +949,9 @@ function 初始化构建环境 {
             $env:JAVA_HOME = (Split-Path (Split-Path $Javac路径.FullName))
             输出成功 "自动检测 JAVA_HOME: $env:JAVA_HOME"
         } else {
-            输出步骤 "安装 JDK 21（Android 构建所需）"
-            确保命令可用 "javac" "EclipseAdoptium.Temurin.21.JDK" "Java 编译器"
-            $Javac路径 = Get-Command javac -ErrorAction SilentlyContinue
-            if ($Javac路径) {
-                $env:JAVA_HOME = (Split-Path (Split-Path $Javac路径.Source))
-                输出成功 "自动安装 JAVA_HOME: $env:JAVA_HOME"
-            } else {
-                输出错误 "JDK 安装后仍找不到 javac"
-                exit 1
-            }
+            输出错误 "找不到 JDK，请安装 JDK 17+ 或设置 JAVA_HOME"
+            输出错误 "推荐: https://adoptium.net/"
+            exit 1
         }
     } else {
         输出成功 "JAVA_HOME: $env:JAVA_HOME"
@@ -839,48 +1026,7 @@ function 初始化构建环境 {
     输出成功 "Android Build Tools 最新版: $BuildTools最新版"
     $script:BuildTools最新版 = $BuildTools最新版
 
-    $Gradle命令 = Get-Command gradle -ErrorAction SilentlyContinue
-    if ($Gradle命令) {
-        $script:Gradle路径 = $Gradle命令.Source
-    } else {
-        # 按语义版本号降序排列，取最新版本的 gradle.bat
-        # 字符串排序会导致 8.9 > 8.14（'9' > '1'），必须用 [version] 比较
-        $Gradle候选列表 = @(
-            (Get-ChildItem (Join-Path $env:USERPROFILE ".gradle\wrapper\dists") -Recurse -Filter "gradle.bat" -ErrorAction SilentlyContinue |
-                Sort-Object { if ($_.FullName -match 'gradle-([0-9.]+)') { [version]$Matches[1] } else { [version]'0.0' } } -Descending |
-                Select-Object -ExpandProperty FullName),
-            (Get-ChildItem "C:\Program Files\Android\Android Studio" -Recurse -Filter "gradle.bat" -ErrorAction SilentlyContinue |
-                Sort-Object { if ($_.FullName -match 'gradle-([0-9.]+)') { [version]$Matches[1] } else { [version]'0.0' } } -Descending |
-                Select-Object -ExpandProperty FullName)
-        ) | Where-Object { $_ }
-
-        $script:Gradle路径 = $Gradle候选列表 | Select-Object -First 1
-    }
-
-    if (-not $script:Gradle路径) {
-        输出步骤 "安装 Gradle（Cordova Android 构建所需）"
-        if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-            输出错误 "找不到可用的 Gradle，且 winget 不可用，请先安装 Gradle 或 Android Studio"
-            exit 1
-        }
-
-        winget install Gradle.Gradle --accept-source-agreements --accept-package-agreements --silent 2>&1 | ForEach-Object { Write-Host "  $_" }
-        $Gradle命令 = Get-Command gradle -ErrorAction SilentlyContinue
-        if ($Gradle命令) {
-            $script:Gradle路径 = $Gradle命令.Source
-        }
-    }
-
-    if (-not $script:Gradle路径) {
-        输出错误 "Gradle 安装后仍不可用"
-        exit 1
-    }
-
-    $GradleBin目录 = Split-Path $script:Gradle路径
-    if ($env:PATH -notlike "*$GradleBin目录*") {
-        $env:PATH = "$GradleBin目录;$env:PATH"
-    }
-    输出成功 "Gradle: $(& $script:Gradle路径 --version 2>&1 | Select-Object -First 1)"
+    设置Gradle为已安装最新版
 
     if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
         $Cargo二进制目录 = Join-Path $env:USERPROFILE ".cargo\bin"
@@ -888,18 +1034,11 @@ function 初始化构建环境 {
             $env:PATH = "$Cargo二进制目录;$env:PATH"
             输出成功 "已将 $Cargo二进制目录 添加到 PATH"
         } else {
-            输出步骤 "安装 Rust（acodex-server 编译所需）"
-            确保命令可用 "rustup" "Rustlang.Rustup" "Rust 工具链管理器"
-            $Cargo二进制目录 = Join-Path $env:USERPROFILE ".cargo\bin"
-            if (Test-Path $Cargo二进制目录) {
-                $env:PATH = "$Cargo二进制目录;$env:PATH"
-            }
+            输出错误 "找不到 'rustup'，请安装 Rust: https://rustup.rs/"
+            exit 1
         }
     }
-    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-        输出错误 "cargo 仍不可用，请重启终端后重试"
-        exit 1
-    }
+    检查命令 "cargo" "请安装 Rust: https://rustup.rs/"
     输出成功 "Rust: $(rustc --version)"
 
     $script:Zig路径 = $null
@@ -1072,19 +1211,17 @@ function 查找NDK工具链 {
 }
 
 # ─── 子模块 URL 配置 ──────────────────────────────────────────────────
-$子模块名称列表 = @("Acode", "acodex-server", "acode-plugin-github", "proot")
+$子模块名称列表 = @("Acode", "acodex-server", "acode-plugin-github")
 $子模块校验文件 = @{
     "Acode"               = "package.json"
     "acodex-server"       = "Cargo.toml"
     "acode-plugin-github" = "package.json"
-    "proot"               = "src/GNUmakefile"
 }
 
 $子模块原始URL = @{
     "Acode"               = "https://github.com/Ebola-Chan-bot/Acode.git"
     "acode-plugin-github" = "https://github.com/Ebola-Chan-bot/acode-plugin-github.git"
     "acodex-server"       = "https://github.com/Ebola-Chan-bot/acodex_server.git"
-    "proot"               = "https://github.com/termux/proot.git"
 }
 
 $镜像前缀列表 = @(
@@ -1687,7 +1824,7 @@ function 转换为FileUrl([string]$文件路径) {
     return [System.Uri]::new((Resolve-Path $文件路径)).AbsoluteUri
 }
 
-function 重建CordovaAndroid平台 {
+function 重建CordovaAndroid平台([bool]$强制 = $false) {
     $已存在平台 = Test-Path $平台根目录
     $CordovaAndroid版本约束 = 获取CordovaAndroid版本约束
     $平台包 = if ([string]::IsNullOrWhiteSpace($CordovaAndroid版本约束)) {
@@ -1699,7 +1836,7 @@ function 重建CordovaAndroid平台 {
     $期望平台版本 = 提取版本号 $CordovaAndroid版本约束
     $已安装平台版本 = if ($已存在平台) { 获取已安装CordovaAndroid版本 } else { $null }
     $已刷新插件数 = 刷新本地Cordova插件
-    $需要重建平台 = $强制重建平台 -or -not $已存在平台
+    $需要重建平台 = $强制 -or $强制重建平台 -or -not $已存在平台
     $script:本地Cordova插件刷新数 = $已刷新插件数
     $script:Android平台已重建 = $false
 
@@ -1732,27 +1869,6 @@ function 重建CordovaAndroid平台 {
         }
     } else {
         输出步骤 "初始化 Cordova Android 平台"
-    }
-
-    # cordova platform add 只在 plugins/android.json 的 installed_plugins 为空时
-    # 才会自动安装插件到新平台。如果 installed_plugins 中有残留记录（如 cordova platform
-    # remove 写回或上次构建遗留），Cordova 认为插件已安装而跳过，导致新平台缺少插件文件。
-    # 在重建平台前清空 installed_plugins，使 cordova platform add 重新走完整插件安装流程。
-    $PluginsJsonPath = Join-Path $Acode根目录 "plugins/android.json"
-    if (Test-Path $PluginsJsonPath -PathType Leaf) {
-        $清空脚本 = @'
-const fs = require("fs");
-const p = process.argv[2];
-const d = JSON.parse(fs.readFileSync(p, "utf8"));
-d.installed_plugins = {};
-d.dependent_plugins = {};
-fs.writeFileSync(p, JSON.stringify(d, null, 2) + "\n");
-'@
-        $清空结果 = 执行Node脚本并捕获输出 -脚本 $清空脚本 -参数 @($PluginsJsonPath)
-        if ($清空结果.退出码 -ne 0) {
-            输出错误 "无法清空 plugins/android.json 的 installed_plugins"
-            exit 1
-        }
     }
 
     Write-Host "  添加 Android 平台: $平台包" -ForegroundColor DarkGray
@@ -1906,7 +2022,7 @@ function 确保DebugAxs下载源可用 {
 }
 
 function 获取AcodexServer终端诊断注入启用状态 {
-    # 旧版通过脚本动态改写 Rust 源码插诊断，已经证明会引入脆弱锚点并污染构建流程；现在统一改为源码内调试日志。 
+    # 旧版通过脚本动态改写 Rust 源码插诊断，已经证明会引入脆弱锚点并污染构建流程；现在统一改为源码内调试日志。
     return $false
 }
 
@@ -1926,344 +2042,6 @@ function 还原AcodexServer终端诊断注入 {
 
     # 与上面的 no-op 成对保留，避免旧调用点继续尝试回滚不存在的动态注入状态。
     return
-}
-
-# ─── 交叉编译 proot ──────────────────────────────────────────────────
-
-function 准备Talloc头文件 {
-    $Talloc缓存目录 = Join-Path $构建缓存目录 "talloc-headers"
-    $TallocH路径 = Join-Path $Talloc缓存目录 "talloc.h"
-
-    if (Test-Path $TallocH路径 -PathType Leaf) {
-        return $Talloc缓存目录
-    }
-
-    输出步骤 "下载 talloc.h 头文件"
-    New-Item -ItemType Directory -Path $Talloc缓存目录 -Force | Out-Null
-
-    # talloc（Samba 项目子库）的 API 非常稳定，不需要版本精确匹配。
-    # 下载单文件 talloc.h 用于编译 proot；运行时链接的 libtalloc.so 由
-    # Acode 预打包的 Cordova 插件提供。
-    $URL列表 = @(
-        "https://raw.githubusercontent.com/samba-team/samba/master/lib/talloc/talloc.h",
-        "https://gitlab.com/samba-team/devel/samba/-/raw/master/lib/talloc/talloc.h"
-    )
-
-    foreach ($URL in $URL列表) {
-        try {
-            Invoke-WebRequest -Uri $URL -OutFile $TallocH路径 -UseBasicParsing -ErrorAction Stop
-            if ((Test-Path $TallocH路径) -and (Get-Item $TallocH路径).Length -gt 1000) {
-                输出成功 "talloc.h 已下载: $URL"
-                return $Talloc缓存目录
-            }
-        } catch {
-            输出警告 "下载失败: $URL"
-        }
-    }
-
-    输出错误 "无法下载 talloc.h，请检查网络连接"
-    exit 1
-}
-
-function 获取Proot源码签名 {
-    $Proot源码Src = Join-Path $Proot源码根目录 "src"
-    if (-not (Test-Path (Join-Path $Proot源码Src "GNUmakefile"))) {
-        return $null
-    }
-
-    return 获取签名摘要 (获取路径签名 @($Proot源码Src))
-}
-
-function 获取Proot编译状态 {
-    param([string]$架构名称)
-
-    $当前签名 = 获取Proot源码签名
-    if ($null -eq $当前签名) {
-        return @{ 需要编译 = $false; 原因 = "proot 子模块不存在"; 可用 = $false }
-    }
-
-    $缓存键 = "proot|$架构名称"
-    $缓存签名 = 获取构建缓存值 $缓存键
-    $产物目录 = Join-Path $构建缓存目录 "proot-build/$架构名称"
-    $Proot产物 = Join-Path $产物目录 "proot"
-    $Loader产物 = Join-Path $产物目录 "loader/loader"
-
-    if (-not (Test-Path $Proot产物) -or -not (Test-Path $Loader产物)) {
-        return @{ 需要编译 = $true; 原因 = "未检测到编译产物"; 当前签名 = $当前签名; 可用 = $true }
-    }
-
-    if ($缓存签名 -ne $当前签名) {
-        $原因 = if ([string]::IsNullOrWhiteSpace([string]$缓存签名)) { "缺少编译签名缓存" } else { "检测到源码变更" }
-        return @{ 需要编译 = $true; 原因 = $原因; 当前签名 = $当前签名; 可用 = $true }
-    }
-
-    return @{ 需要编译 = $false; 当前签名 = $当前签名; 可用 = $true }
-}
-
-function 编译Proot单架构 {
-    param(
-        [string]$架构名称,
-        [string]$CC路径,
-        [string]$CC32路径,
-        [string]$STRIP路径,
-        [string]$READELF路径,
-        [string]$OBJCOPY路径,
-        [string]$OBJDUMP路径,
-        [string]$Talloc头文件目录,
-        [string]$Talloc库目录
-    )
-
-    $Proot源码Src = Join-Path $Proot源码根目录 "src"
-    $GNUmakefile路径 = Join-Path $Proot源码Src "GNUmakefile"
-    $构建目录 = Join-Path $构建缓存目录 "proot-build/$架构名称"
-
-    # 清空旧构建产物后重建目录
-    if (Test-Path $构建目录) { Remove-Item $构建目录 -Recurse -Force }
-    New-Item -ItemType Directory -Path $构建目录 -Force | Out-Null
-
-    # make 的 $(shell) 通过 SHELL 指定的程序执行命令。
-    # 路径含空格或括号（如 "Program Files (x86)"）会导致 sh 语法错误，
-    # 因此所有传给 make 的路径必须先转为 Windows 8.3 短路径格式。
-    确保命令可用 "git" "Git.Git" "proot 编译需要 POSIX shell (sh.exe)"
-    $SH路径 = "C:\Program Files\Git\bin\sh.exe"
-    if (-not (Test-Path $SH路径)) {
-        输出错误 "Git 已安装但 sh.exe 不在预期位置: $SH路径"
-        exit 1
-    }
-    确保命令可用 "make" "ezwinports.make" "proot 编译所需"
-    $MAKE路径 = (Get-Command make -ErrorAction SilentlyContinue).Source
-
-    # 将含空格/括号的路径转为 8.3 短路径；make $(shell) 中的 sh 无法处理这类路径。
-    function 获取短路径([string]$路径) {
-        $output = cmd /c "for %I in (`"$路径`") do @echo %~sI" 2>&1
-        $短路径 = ($output | Select-Object -First 1).Trim()
-        if ([string]::IsNullOrWhiteSpace($短路径) -or -not (Test-Path $短路径)) {
-            输出错误 "无法获取短路径: $路径"
-            exit 1
-        }
-        return $短路径 -replace '\\', '/'
-    }
-
-    $短CC       = 获取短路径 $CC路径
-    $短CC32     = 获取短路径 $CC32路径
-    $短STRIP    = 获取短路径 $STRIP路径
-    $短READELF  = 获取短路径 $READELF路径
-    $短OBJCOPY  = 获取短路径 $OBJCOPY路径
-    $短OBJDUMP  = 获取短路径 $OBJDUMP路径
-    $短SH       = 获取短路径 $SH路径
-    $短Talloc头 = 获取短路径 $Talloc头文件目录
-    $短Talloc库 = 获取短路径 $Talloc库目录
-
-    # NDK clang.exe 本身支持 --target 和 --sysroot，不需要 .cmd 包装器。
-    # 查找 sysroot 路径（CC 所在 bin 目录的同级 sysroot）。
-    $工具链根 = Split-Path (Split-Path $CC路径)
-    $Sysroot路径 = Join-Path $工具链根 "sysroot"
-    $短Sysroot = 获取短路径 $Sysroot路径
-
-    # 从 .cmd 包装器文件名中提取 --target 值。
-    # 例如 "aarch64-linux-android28-clang.cmd" → "aarch64-linux-android28"
-    $CC文件名 = [System.IO.Path]::GetFileNameWithoutExtension($CC路径) -replace '-clang$', ''
-    $CC32文件名 = [System.IO.Path]::GetFileNameWithoutExtension($CC32路径) -replace '-clang$', ''
-
-    # GNUmakefile 的 CC_TARGET/CC_SYSROOT 机制把 --target 和 --sysroot
-    # 作为独立的 make 变量传入，由 GNUmakefile 负责拼接到编译和链接命令中。
-    # 这样 CC 变量可以是简单的 clang.exe 路径，不需要 wrapper 脚本。
-
-    $PROOT_UNBUNDLE_LOADER = "/data/data/com.foxdebug.acode/files"
-
-    # ── 生成构建脚本 ──
-    # 必须在 Git Bash 中运行 make，而不是从 PowerShell 直接调用 ezwinports make。
-    # 原因：ezwinports make 是原生 Windows 程序，MAKEFILE_LIST 中的路径使用反斜杠，
-    # $(shell ...) 使用 cmd.exe 而非 SHELL，导致 POSIX 工具（mkdir -p, egrep 等）
-    # 和路径中的反斜杠转义全部失败。在 bash 中运行则所有路径自动为 POSIX 格式。
-    function Win路径转Unix([string]$路径) {
-        $路径 = $路径 -replace '\\', '/'
-        if ($路径 -match '^([A-Za-z]):(.*)$') {
-            return "/" + $Matches[1].ToLower() + $Matches[2]
-        }
-        return $路径
-    }
-
-    $unixMAKE       = Win路径转Unix $MAKE路径
-    $unixMakefile   = Win路径转Unix $GNUmakefile路径
-    $unixBuildDir   = Win路径转Unix $构建目录
-    $unixCC         = Win路径转Unix $短CC
-    $unixCC32       = Win路径转Unix $短CC32
-    $unixSysroot    = Win路径转Unix $短Sysroot
-    $unixSTRIP      = Win路径转Unix (获取短路径 $STRIP路径)
-    $unixREADELF    = Win路径转Unix (获取短路径 $READELF路径)
-    $unixOBJCOPY    = Win路径转Unix (获取短路径 $OBJCOPY路径)
-    $unixOBJDUMP    = Win路径转Unix (获取短路径 $OBJDUMP路径)
-    $unixTallocInc  = Win路径转Unix (获取短路径 $Talloc头文件目录)
-    # ld.lld 是 Windows 原生二进制，不理解 MSYS2 格式 (/c/...)，
-    # 所以 LDFLAGS 的 -L 路径必须用 Windows 格式 (C:/...)。
-    $winTallocLib   = (获取短路径 $Talloc库目录) -replace '\\','/'
-    # VPATH/SRC 指向源文件目录；命令行传入 CPPFLAGS 会覆盖 GNUmakefile 中的
-    # CPPFLAGS += -I$(VPATH)，所以必须在此处显式包含源文件目录。
-    $unixSrcDir     = Win路径转Unix (Join-Path $Proot源码根目录 "src")
-    # 设置 SHELL 为 Git Bash 的 sh.exe，使得 make 的 $(shell ...) 和 recipe
-    # 都使用 POSIX shell 而非 cmd.exe。ezwinports make 作为原生 Windows 程序，
-    # 默认使用 cmd.exe 执行 $(shell ...)，导致 grep/egrep/tr 等 POSIX 工具不可用。
-    # 注意：SHELL 必须用 Windows 格式路径（C:/...），不能用 Unix 格式（/c/...），
-    # 因为 ezwinports make 是原生 Windows 程序，不认识 /c/ 前缀。
-    $winSH          = $短SH  # 已由 获取短路径 转为正斜杠的 8.3 短路径，如 C:/PROGRA~1/Git/bin/sh.exe
-
-    # 确定目标架构的 loader 地址。这些值来自 proot/src/arch.h 中各架构宏定义。
-    # 直接传递给 make 而非由 make 的 $(shell) 探测，因为 ezwinports make 的
-    # $(shell) 在 Windows 上不可靠。
-    $loaderAddress = switch ($CC文件名) {
-        { $_ -match '^aarch64-' } { '0x2000000000' }
-        { $_ -match '^x86_64-' }  { '0x600000000000' }
-        { $_ -match '^i[36]86-' } { '0xa0000000' }
-        { $_ -match '^arm' }      { '0x20000000' }
-        default { 输出错误 "无法确定架构 $CC文件名 的 LOADER_ADDRESS"; exit 1 }
-    }
-    $loader32Address = switch ($CC32文件名) {
-        { $_ -match '^arm' }      { '0x20000000' }
-        { $_ -match '^i[36]86-' } { '0xa0000000' }
-        default { '0x20000000' }  # 32-bit ARM as fallback
-    }
-
-    # ── 获取版本号 ──
-    # 传给 make 的 VERSION 变量，由 GNUmakefile 写入 build.h，
-    # 跳过 $(GIT) describe 的 $(shell) 调用。
-    $version = & git -C $Proot源码根目录 describe --tags --dirty --abbrev=8 --always 2>$null
-    if (-not $version) { $version = "unknown" }
-
-    $buildScript路径 = Join-Path $构建目录 "run-make.sh"
-    $buildScriptContent = @"
-#!/bin/bash
-set -e
-cd "$unixBuildDir"
-# 禁止 MSYS2 自动将 /data/... 转换为 C:/Program Files/Git/data/...
-# PROOT_UNBUNDLE_LOADER 的值是 Android 设备上的路径，不是 Windows 路径。
-export MSYS2_ARG_CONV_EXCL="PROOT_UNBUNDLE_LOADER"
-exec "$unixMAKE" \
-  -f "$unixMakefile" \
-  -j$([Environment]::ProcessorCount) \
-  V=1 \
-  "SHELL=$winSH" \
-  CC="$unixCC" \
-  CC_TARGET=$CC文件名 \
-  CC32="$unixCC32" \
-  CC32_TARGET=$CC32文件名 \
-  CC_SYSROOT="$unixSysroot" \
-  CC32_FLAG= \
-  STRIP="$unixSTRIP" \
-  READELF="$unixREADELF" \
-  OBJCOPY="$unixOBJCOPY" \
-  OBJDUMP="$unixOBJDUMP" \
-  PROOT_UNBUNDLE_LOADER=$PROOT_UNBUNDLE_LOADER \
-  HAS_LOADER_32BIT=true \
-  HAS_POKEDATA_WORKAROUND=true \
-  LOADER_ADDRESS=$loaderAddress \
-  LOADER_ADDRESS-m32=$loader32Address \
-  "BUILD_ID_NONE=,--build-id=none" \
-  "VERSION=$version" \
-  HAVE_PROCESS_VM=1 \
-  HAVE_SECCOMP_FILTER=1 \
-  "USE_BUILD_H=cli/cli.o cli/proot.o execve/aoxp.o extension/extension.o path/path.o syscall/seccomp.o tracee/mem.o" \
-  "CPPFLAGS=-D_FILE_OFFSET_BITS=64 -D_GNU_SOURCE -I. -I$unixSrcDir -I$unixTallocInc -DARG_MAX=131072 -Wno-error=implicit-function-declaration" \
-  "LDFLAGS=-L$winTallocLib -ltalloc -Wl,-z,noexecstack"
-"@
-    [System.IO.File]::WriteAllText($buildScript路径, $buildScriptContent,
-        [System.Text.UTF8Encoding]::new($false))
-
-    # ── 执行构建 ──
-    Write-Host "  bash run-make.sh" -ForegroundColor DarkGray
-    $make输出 = & $SH路径 $buildScript路径 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        foreach ($行 in @($make输出)) { Write-Host "  $行" -ForegroundColor Red }
-        输出错误 "proot make 失败 (exit code: $LASTEXITCODE)"
-        exit 1
-    }
-    foreach ($行 in @($make输出)) { Write-Host "  $行" -ForegroundColor DarkGray }
-
-    # ── 验证产物 ──
-    $Proot产物 = Join-Path $构建目录 "proot"
-    $Loader产物 = Join-Path $构建目录 "loader/loader"
-    $Loader32产物 = Join-Path $构建目录 "loader/loader-m32"
-
-    if (-not (Test-Path $Proot产物)) { 输出错误 "proot 产物不存在: $Proot产物"; exit 1 }
-    if (-not (Test-Path $Loader产物)) { 输出错误 "loader 产物不存在: $Loader产物"; exit 1 }
-
-    & $STRIP路径 $Proot产物 2>&1 | Out-Null
-    & $STRIP路径 $Loader产物 2>&1 | Out-Null
-
-    $prootSizeKB = [math]::Round((Get-Item $Proot产物).Length / 1KB, 1)
-    $loaderSizeKB = [math]::Round((Get-Item $Loader产物).Length / 1KB, 1)
-    输出成功 "proot: $prootSizeKB KB, loader: $loaderSizeKB KB"
-
-    if (Test-Path $Loader32产物) {
-        & $STRIP路径 $Loader32产物 2>&1 | Out-Null
-        $loader32SizeKB = [math]::Round((Get-Item $Loader32产物).Length / 1KB, 1)
-        输出成功 "loader32: $loader32SizeKB KB"
-    }
-}
-
-function 编译Proot {
-    输出步骤 "交叉编译 proot → Android"
-
-    $Proot源码Src = Join-Path $Proot源码根目录 "src"
-    if (-not (Test-Path (Join-Path $Proot源码Src "GNUmakefile"))) {
-        输出警告 "proot 子模块不存在或不完整，跳过 proot 编译"
-        return
-    }
-
-    $NDK工具链 = 查找NDK工具链
-    $工具链Bin = $NDK工具链.工具链Bin目录
-    $Talloc头文件目录 = 准备Talloc头文件
-
-    # ── arm64（主目标：华为设备、大多数现代 Android 手机）──
-    $arm64编译状态 = 获取Proot编译状态 "arm64"
-    if ($arm64编译状态.需要编译) {
-        输出步骤 "编译 proot arm64 ($($arm64编译状态.原因))"
-        编译Proot单架构 `
-            -架构名称 "arm64" `
-            -CC路径 (Join-Path $工具链Bin "aarch64-linux-android${NDK接口级别}-clang.cmd") `
-            -CC32路径 (Join-Path $工具链Bin "armv7a-linux-androideabi${NDK接口级别}-clang.cmd") `
-            -STRIP路径 (Join-Path $工具链Bin "llvm-strip.exe") `
-            -READELF路径 (Join-Path $工具链Bin "llvm-readelf.exe") `
-            -OBJCOPY路径 (Join-Path $工具链Bin "llvm-objcopy.exe") `
-            -OBJDUMP路径 (Join-Path $工具链Bin "llvm-objdump.exe") `
-            -Talloc头文件目录 $Talloc头文件目录 `
-            -Talloc库目录 (Join-Path $Acode源码根目录 "src/plugins/proot/libs/arm64")
-
-        设置构建缓存值 "proot|arm64" $arm64编译状态.当前签名
-        输出成功 "proot arm64 编译完成"
-    } else {
-        输出成功 "proot arm64 源码未变化，跳过编译"
-    }
-}
-
-function 应用Proot编译产物到平台 {
-    # 将 build cache 中编译好的 proot 二进制覆盖到平台 jniLibs，这样构建出的 APK
-    # 使用的是最新编译的 proot 而不是 Acode 源码树中的预编译版本。
-    # 仅修改平台产物目录，不改动 Acode 源码树，因此不影响源码保护校验。
-    $arm64构建目录 = Join-Path $构建缓存目录 "proot-build/arm64"
-    $Proot产物 = Join-Path $arm64构建目录 "proot"
-    $Loader产物 = Join-Path $arm64构建目录 "loader/loader"
-    $Loader32产物 = Join-Path $arm64构建目录 "loader/loader-m32"
-
-    if (-not (Test-Path $Proot产物) -or -not (Test-Path $Loader产物)) {
-        输出警告 "未找到 proot 编译产物，平台将使用预编译版本"
-        return
-    }
-
-    $jniLibs目录 = Join-Path $平台根目录 "app/src/main/jniLibs/arm64-v8a"
-    if (-not (Test-Path $jniLibs目录)) {
-        输出警告 "平台 jniLibs/arm64-v8a 目录不存在，跳过 proot 产物部署"
-        return
-    }
-
-    Copy-Item $Proot产物 (Join-Path $jniLibs目录 "libproot-xed.so") -Force
-    Copy-Item $Loader产物 (Join-Path $jniLibs目录 "libproot.so") -Force
-
-    if ((Test-Path $Loader32产物) -and (Test-Path (Join-Path $jniLibs目录 "libproot32.so"))) {
-        Copy-Item $Loader32产物 (Join-Path $jniLibs目录 "libproot32.so") -Force
-    }
-
-    输出成功 "已将 proot 编译产物部署到平台 jniLibs/arm64-v8a"
 }
 
 # ─── 构建前端资源 ─────────────────────────────────────────────────────
@@ -2372,6 +2150,21 @@ function 同步前端产物到平台 {
     }
 }
 
+function 自动修复Android平台污染 {
+    输出步骤 "自动修复 Cordova Android 平台污染"
+    输出警告 "检测到平台生成文件重复注入，正在重建 Android 平台并重新同步构建产物"
+
+    Push-Location $Acode根目录
+    try {
+        重建CordovaAndroid平台 $true
+    } finally {
+        Pop-Location
+    }
+
+    同步前端产物到平台
+    应用调试构建改动
+}
+
 # ─── Gradle 构建 APK ──────────────────────────────────────────────────
 function 使用本机Gradle构建APK {
     if (-not $script:Gradle路径 -or -not (Test-Path $script:Gradle路径)) {
@@ -2388,6 +2181,25 @@ function 使用本机Gradle构建APK {
 
     输出成功 "使用本机 Gradle: $script:Gradle路径"
     $Gradle退出码 = 执行外部命令并输出 $script:Gradle路径 $Gradle参数
+    if ($Gradle退出码 -ne 0) {
+        $真实最低版本 = 从Gradle输出提取最低版本 $script:最近外部命令输出
+        if ($真实最低版本) {
+            输出警告 "Android Gradle Plugin 要求 Gradle >= $真实最低版本，当前为 $($script:Gradle版本)"
+            if (确保Gradle满足真实需求 $真实最低版本) {
+                输出步骤 "使用自动更新后的 Gradle 重试 APK 构建"
+                输出成功 "使用本机 Gradle: $script:Gradle路径"
+                $Gradle退出码 = 执行外部命令并输出 $script:Gradle路径 $Gradle参数
+            }
+        }
+    }
+
+    if ($Gradle退出码 -ne 0 -and (测试Gradle输出是否为Android平台污染 $script:最近外部命令输出)) {
+        自动修复Android平台污染
+        输出步骤 "使用修复后的 Android 平台重试 APK 构建"
+        输出成功 "使用本机 Gradle: $script:Gradle路径"
+        $Gradle退出码 = 执行外部命令并输出 $script:Gradle路径 $Gradle参数
+    }
+
     if ($Gradle退出码 -ne 0) {
         输出错误 "本机 Gradle 构建失败 (exit code: $Gradle退出码)"
         exit 1
@@ -2591,14 +2403,8 @@ switch ($动作) {
         编译AcodexServer
     }
 
-    "build-proot" {
-        初始化构建环境
-        编译Proot
-    }
-
     "build-apk" {
         初始化构建环境
-        编译Proot
         清空调试服务器输出日志
         安装Node依赖
         开始源码保护
@@ -2606,7 +2412,6 @@ switch ($动作) {
         确保DebugAxs下载源可用
         构建前端
         同步前端产物到平台
-        应用Proot编译产物到平台
         应用调试构建改动
         构建APK
         验证源码未被修改
@@ -2623,7 +2428,6 @@ switch ($动作) {
     "full" {
         初始化构建环境
         初始化子模块
-        编译Proot
         清空调试服务器输出日志
         安装Node依赖
         开始源码保护
@@ -2634,7 +2438,6 @@ switch ($动作) {
         }
         构建前端
         同步前端产物到平台
-        应用Proot编译产物到平台
         应用调试构建改动
         $APK文件 = 构建APK
         验证源码未被修改
